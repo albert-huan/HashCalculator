@@ -2,14 +2,18 @@
 
 # HashCalculator（哈希值计算器）
 
-[![GitHub stars](https://img.shields.io/github/stars/hrpzcf/HashCalculator?style=flat)](https://github.com/hrpzcf/HashCalculator/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/hrpzcf/HashCalculator)](https://github.com/hrpzcf/HashCalculator/issues)
-[![GitHub forks](https://img.shields.io/github/forks/hrpzcf/HashCalculator?style=flat)](https://github.com/hrpzcf/HashCalculator/network)
-[![GitHub license](https://img.shields.io/github/license/hrpzcf/HashCalculator)](https://github.com/hrpzcf/HashCalculator/blob/main/LICENSE)
-![GitHub commit activity](https://img.shields.io/github/commit-activity/w/hrpzcf/HashCalculator)
-[![GitHub release](https://img.shields.io/github/v/release/hrpzcf/HashCalculator)](https://github.com/hrpzcf/HashCalculator/releases)
+[![GitHub stars](https://img.shields.io/github/stars/albert-huan/HashCalculator?style=flat)](https://github.com/albert-huan/HashCalculator/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/albert-huan/HashCalculator)](https://github.com/albert-huan/HashCalculator/issues)
+[![GitHub forks](https://img.shields.io/github/forks/albert-huan/HashCalculator?style=flat)](https://github.com/albert-huan/HashCalculator/network)
+[![GitHub license](https://img.shields.io/github/license/albert-huan/HashCalculator)](https://github.com/albert-huan/HashCalculator/blob/main/LICENSE.txt)
+![GitHub commit activity](https://img.shields.io/github/commit-activity/w/albert-huan/HashCalculator)
+[![GitHub release](https://img.shields.io/github/v/release/albert-huan/HashCalculator)](https://github.com/albert-huan/HashCalculator/releases)
 
 </div>
+
+<br/>
+
+> **优化版本说明**：本仓库是 [hrpzcf/HashCalculator](https://github.com/hrpzcf/HashCalculator) 的优化版本，在原版基础上新增「校验值」列与即时比对、校验清单回填、Word 表格复制、CSV 安全转义，并修复多处并发与稳定性问题。详细变更见 [CHANGELOG.md](CHANGELOG.md)。原项目的 GPL v3.0 许可与版权声明保持不变。
 
 <br/>
 
@@ -23,7 +27,7 @@ HashCalculator 是一款**开源、免费、单文件免安装**的文件哈希�
 
 ## 下载与使用
 
-- 前往 [Releases](https://github.com/hrpzcf/HashCalculator/releases) 页面下载最新版本的可执行文件。
+- 前往 [Releases](https://github.com/albert-huan/HashCalculator/releases) 页面下载最新版本的可执行文件（若本优化版本尚未发布 Release，可先自行编译）。
 - 下载后解压（或直接）运行 `HashCalculator.exe` 即可开始使用。
 - 也可通过 `hashcalculator` 命令行形式调用（详见下方 [命令行参数说明](#命令行参数说明)）。
 
@@ -145,4 +149,4 @@ HashCalculator 是一款**开源、免费、单文件免安装**的文件哈希�
 
 ## 更新日志
 
-- [程序更新日志](https://github.com/hrpzcf/HashCalculator/blob/main/CHANGELOG.md)
+- [程序更新日志](CHANGELOG.md)
