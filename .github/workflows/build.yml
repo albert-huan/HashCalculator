@@ -100,7 +100,7 @@ jobs:
           $env:PATH = "$mingw32;$mingw64;$env:PATH"
           $gcc = Join-Path $mingw32 'gcc.exe'
           $gxx = Join-Path $mingw32 'g++.exe'
-          $make = Join-Path $mingw32 'mingw32-make.exe'
+          $make = Join-Path $mingw64 'mingw32-make.exe'
           cmake -S OpenHashLibs -B build\hashalgs-x86 -G "MinGW Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_SH=CMAKE_SH-NOTFOUND `
