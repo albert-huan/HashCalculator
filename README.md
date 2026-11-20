@@ -2,6 +2,7 @@
 
 # HashCalculator（哈希值计算器）
 
+[![Build](https://github.com/albert-huan/HashCalculator/actions/workflows/build.yml/badge.svg)](https://github.com/albert-huan/HashCalculator/actions/workflows/build.yml)
 [![GitHub stars](https://img.shields.io/github/stars/albert-huan/HashCalculator?style=flat)](https://github.com/albert-huan/HashCalculator/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/albert-huan/HashCalculator)](https://github.com/albert-huan/HashCalculator/issues)
 [![GitHub forks](https://img.shields.io/github/forks/albert-huan/HashCalculator?style=flat)](https://github.com/albert-huan/HashCalculator/network)
