@@ -43,6 +43,7 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Setup MSYS2 / MinGW-w64
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -73,26 +74,39 @@ jobs:
       - name: Build hashalgs (x64)
         shell: pwsh
         run: |
-          $env:PATH = "C:\msys64\mingw64\bin;C:\msys64\mingw32\bin;$env:PATH"
+          $msysRoot = '${{ steps.msys2.outputs.msys2-location }}'
+          $mingw64 = Join-Path $msysRoot 'mingw64\bin'
+          $mingw32 = Join-Path $msysRoot 'mingw32\bin'
+          $env:PATH = "$mingw64;$mingw32;$env:PATH"
+          $gcc = Join-Path $mingw64 'gcc.exe'
+          $gxx = Join-Path $mingw64 'g++.exe'
+          $make = Join-Path $mingw64 'mingw32-make.exe'
           cmake -S OpenHashLibs -B build\hashalgs-x64 -G "MinGW Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_SH=CMAKE_SH-NOTFOUND `
-            -DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe `
-            -DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe `
-            -DCMAKE_MAKE_PROGRAM=C:/msys64/mingw64/bin/mingw32-make.exe
+            -DCMAKE_C_COMPILER="$gcc" `
+            -DCMAKE_CXX_COMPILER="$gxx" `
+            -DCMAKE_MAKE_PROGRAM="$make"
           cmake --build build\hashalgs-x64 --config Release --parallel
           Get-ChildItem HashCalculator\LibraryFiles\hashalgs_x64.dll | Select-Object Name,Length
 
       - name: Build hashalgs (x86)
         shell: pwsh
         run: |
-          $env:PATH = "C:\msys64\mingw32\bin;C:\msys64\mingw64\bin;$env:PATH"
+          $msysRoot = '${{ steps.msys2.outputs.msys2-location }}'
+          $mingw64 = Join-Path $msysRoot 'mingw64\bin'
+          $mingw32 = Join-Path $msysRoot 'mingw32\bin'
+          if (-not (Test-Path $mingw32)) { throw "MinGW32 toolchain not found at $mingw32" }
+          $env:PATH = "$mingw32;$mingw64;$env:PATH"
+          $gcc = Join-Path $mingw32 'gcc.exe'
+          $gxx = Join-Path $mingw32 'g++.exe'
+          $make = Join-Path $mingw32 'mingw32-make.exe'
           cmake -S OpenHashLibs -B build\hashalgs-x86 -G "MinGW Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_SH=CMAKE_SH-NOTFOUND `
-            -DCMAKE_C_COMPILER=C:/msys64/mingw32/bin/gcc.exe `
-            -DCMAKE_CXX_COMPILER=C:/msys64/mingw32/bin/g++.exe `
-            -DCMAKE_MAKE_PROGRAM=C:/msys64/mingw32/bin/mingw32-make.exe
+            -DCMAKE_C_COMPILER="$gcc" `
+            -DCMAKE_CXX_COMPILER="$gxx" `
+            -DCMAKE_MAKE_PROGRAM="$make"
           cmake --build build\hashalgs-x86 --config Release --parallel
           Get-ChildItem HashCalculator\LibraryFiles\hashalgs_x86.dll | Select-Object Name,Length
 
