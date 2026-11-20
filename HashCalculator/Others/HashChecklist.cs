@@ -29,6 +29,12 @@ public class HashChecker
 
     public bool IsExistingFile { get; set; }
 
+    /// <summary>
+    /// 清单里是否存在不带文件名的条目（纯哈希列表）。这类清单的哈希值与具体行无法一一对应，
+    /// 不应把期望值回填到各行的【校验值】列。
+    /// </summary>
+    public bool IsFileIndependent => this.fileIndependent;
+
     public HashChecker() { }
 
     public HashChecker(string relpath, AlgoType algo, byte[] hashBytes)
@@ -52,7 +58,13 @@ public class HashChecker
 
     public CmpRes ComparisonResultOf(AlgoType algoType, byte[] hashBytes)
     {
-        if (hashBytes == null || this.itemCount == 0)
+        if (this.itemCount == 0)
+        {
+            // 清单里一条可比条目都没有时不应给出"无关联"结论，
+            // 否则没有输入校验值的行也会出现校验结果图标
+            return CmpRes.NoResult;
+        }
+        if (hashBytes == null)
         {
             return CmpRes.Unrelated;
         }
@@ -123,6 +135,104 @@ public class HashChecker
         }
         return existingDigestLengths;
     }
+
+    /// <summary>
+    /// 把清单的期望值与比对结论一次性写入目标行。<br/>
+    /// 结论一律取自 <see cref="ComparisonResultOf"/>，期望值只在该结论有明确含义时显示：
+    /// 已匹配显示与结果相同的值，不匹配显示清单里的值，不确定/无关联则清空。<br/>
+    /// 这样【校验值】列与【校验结果】列永远不会互相矛盾；无文件名的纯哈希清单、
+    /// 同算法多条目、UNKNOWN（算法未知）回退等情形都按同一套语义处理。<br/>
+    /// 仅在结果尚未算出时，才允许用清单里唯一的候选值预填，且不给出比对结论。
+    /// </summary>
+    public void ApplyTo(HashViewModel model, OutputType outputType)
+    {
+        if (model?.AlgoInOutModels == null)
+        {
+            return;
+        }
+        foreach (AlgoInOutModel inOut in model.AlgoInOutModels)
+        {
+            byte[] actual = inOut.HashResult;
+            CmpRes result = this.ComparisonResultOf(inOut.AlgoType, actual);
+            byte[] expected;
+            switch (result)
+            {
+                case CmpRes.Matched:
+                    expected = actual;
+                    break;
+                case CmpRes.Mismatch:
+                    expected = this.FirstSameAlgoBytes(inOut.AlgoType);
+                    break;
+                default:
+                    expected = null;
+                    break;
+            }
+            if (actual == null && result == CmpRes.Unrelated)
+            {
+                // 文件还没算出结果：清单里若有唯一候选值，先填进【校验值】列
+                expected = this.UniqueExpectedBytes(inOut.AlgoType);
+                result = CmpRes.NoResult;
+            }
+            inOut.SetExpectedAndResult(expected, result, outputType);
+        }
+    }
+
+    /// <summary>取清单中该算法的第一个期望值；没有同算法条目时返回 null。</summary>
+    private byte[] FirstSameAlgoBytes(AlgoType algoType)
+    {
+        for (int i = 0; i < this.itemCount; ++i)
+        {
+            if (this.algoTypes[i] == algoType)
+            {
+                return this.hashByteLists[i];
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 结果尚未算出时用于预填：优先同算法条目且值唯一，其次 UNKNOWN 条目且值唯一。
+    /// 存在多个互不相同的候选值时无法判断该显示哪个，返回 null。
+    /// </summary>
+    private byte[] UniqueExpectedBytes(AlgoType algoType)
+    {
+        byte[] unique = null;
+        for (int i = 0; i < this.itemCount; ++i)
+        {
+            if (this.algoTypes[i] != algoType)
+            {
+                continue;
+            }
+            if (unique == null)
+            {
+                unique = this.hashByteLists[i];
+            }
+            else if (!BytesComparer.Default.Equals(unique, this.hashByteLists[i]))
+            {
+                return null;
+            }
+        }
+        if (unique != null)
+        {
+            return unique;
+        }
+        for (int i = 0; i < this.itemCount; ++i)
+        {
+            if (this.algoTypes[i] != AlgoType.UNKNOWN)
+            {
+                continue;
+            }
+            if (unique == null)
+            {
+                unique = this.hashByteLists[i];
+            }
+            else if (!BytesComparer.Default.Equals(unique, this.hashByteLists[i]))
+            {
+                return null;
+            }
+        }
+        return unique;
+    }
 }
 
 public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
@@ -150,6 +260,14 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
     private static Encoding[] _supportedEncodings = null;
     private static readonly char[] directorySeparators = new char[] { '/', '\\' };
     private Dictionary<string, HashChecker> fileHashCheckerDict = null;
+
+    /// <summary>
+    /// 统一的文件哈希表访问入口：字典惰性创建，保证任何实例（包括仅经无参构造、
+    /// 尚未调用 Initialize 的实例）上读取都不会出现空引用。
+    /// </summary>
+    private Dictionary<string, HashChecker> FileHashCheckerDict =>
+        this.fileHashCheckerDict ??= new Dictionary<string, HashChecker>(
+            StringComparer.OrdinalIgnoreCase);
 
     public static HashChecklist Text(string text)
     {
@@ -193,33 +311,26 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
 
     IEnumerator IEnumerable.GetEnumerator()
     {
-        return this.fileHashCheckerDict.GetEnumerator();
+        return this.FileHashCheckerDict.GetEnumerator();
     }
 
     public IEnumerator<KeyValuePair<string, HashChecker>> GetEnumerator()
     {
-        return this.fileHashCheckerDict.GetEnumerator();
+        return this.FileHashCheckerDict.GetEnumerator();
     }
 
     private void Initialize()
     {
         this.ReasonForFailure = null;
         this.KeysAreRelativePaths = false;
-        if (this.fileHashCheckerDict == null)
-        {
-            this.fileHashCheckerDict = new Dictionary<string, HashChecker>(
-                StringComparer.OrdinalIgnoreCase);
-        }
-        else
-        {
-            this.fileHashCheckerDict.Clear();
-        }
+        // 惰性属性保证字典存在，清空即可；不再需要单独处理"首次创建"
+        this.FileHashCheckerDict.Clear();
     }
 
     public bool IsNameInChecklist(string fileName)
     {
         if (!string.IsNullOrEmpty(fileName) &&
-            this.fileHashCheckerDict.TryGetValue(fileName, out HashChecker value))
+            this.FileHashCheckerDict.TryGetValue(fileName, out HashChecker value))
         {
             value.IsExistingFile = true;
             return true;
@@ -238,13 +349,14 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
         {
             algoType = this.AlgoTypeFromFileExt;
         }
-        if (CommonUtils.HashBytesFromString(hash) is byte[] hashBytes)
+        if (CommonUtils.HashBytesFromString(hash) is byte[] hashBytes &&
+            CommonUtils.IsSupportedDigestLength(hashBytes.Length))
         {
             relpath = relpath.Replace('/', '\\');
-            if (!this.fileHashCheckerDict.TryGetValue(relpath, out HashChecker hashChecker))
+            if (!this.FileHashCheckerDict.TryGetValue(relpath, out HashChecker hashChecker))
             {
                 hashChecker = new HashChecker();
-                this.fileHashCheckerDict[relpath] = hashChecker;
+                this.FileHashCheckerDict[relpath] = hashChecker;
             }
             // 从校验信息文件内容和扩展名推断 algoType 后，无论是否仍是 UNKNOWN，都添加到 HashChecker
             hashChecker.AddCheckerItem(relpath, algoType, hashBytes);
@@ -324,9 +436,9 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
             {
                 PrepareSupportedEncodings();
             }
-            // 逐个候选编码充当探测：解码失败会抛 DecoderFallbackException（可能出现在读取中途），
-            // 此时清掉已解析出的内容并换下一个编码；能读到底就采用这个编码，不再试后面的。
-            // 所以 ExtendChecklistWithReader 不需要返回值：它不抛异常就代表"这份编码可用"。
+            // 逐个候选编码充当探测：解码抛 DecoderFallbackException、或虽能解码但
+            // 一条校验信息都解析不出来，都说明这份编码不对（例如无 BOM 的 UTF-16LE
+            // 在严格 UTF-8 下只是一串合法的 NUL/ASCII，读到底也不报错），换下一个编码。
             foreach (Encoding encoding in _supportedEncodings)
             {
                 using (StreamReader reader = new StreamReader(filePath, encoding, true,
@@ -334,8 +446,11 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
                 {
                     try
                     {
-                        this.ExtendChecklistWithReader(reader, fileExt);
-                        return this.ReasonForFailure;
+                        if (this.ExtendChecklistWithReader(reader, fileExt))
+                        {
+                            return this.ReasonForFailure;
+                        }
+                        this.Initialize();
                     }
                     catch (DecoderFallbackException)
                     {
@@ -343,11 +458,12 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
                     }
                 }
             }
-            this.ReasonForFailure = "只支持 UTF8/ANSI/UNICODE/GB18030 及兼容编码的校验信息文件。";
+            this.ReasonForFailure = "无法解析校验信息文件：内容不符合任何已启用的解析方案，" +
+                "或文件编码不是 UTF8/ANSI/UNICODE/GB18030 及兼容编码。";
         }
         catch (Exception ex)
         {
-            this.fileHashCheckerDict?.Clear();
+            this.FileHashCheckerDict.Clear();
             this.ReasonForFailure = $"出现异常导致解析校验信息失败：\n{ex.Message}";
         }
         return this.ReasonForFailure;
@@ -358,14 +474,15 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
     /// 仅支持"匹配跨度有界"的解析方案：跨度无界的正则（如 (?s)、[\s\S]*）无法分块；
     /// 积累的未解析内容超过 <see cref="ChecklistWaitChars"/> 个字符即报错终止。
     /// </summary>
-    private void ExtendChecklistWithReader(StreamReader reader, string fileExt)
+    private bool ExtendChecklistWithReader(StreamReader reader, string fileExt)
     {
         // 解析方案只取决于扩展名与设置，与文件内容无关：先判空，省掉整份文件的读取与逐块切字符串
         ChecklistParserSession parserSession = new ChecklistParserSession(fileExt);
         if (parserSession.IsEmpty)
         {
             this.ReasonForFailure = "没有可用的校验信息解析方案。";
-            return;
+            // 与编码无关，换哪种编码都不会有方案，直接定案
+            return true;
         }
         int readCount;
         char[] readBuffer = new char[ChecklistReadChars];
@@ -386,7 +503,8 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
             }
             if (!this.ExtendChecklistWithChunk(chunkBuilder, parserSession))
             {
-                return;   // 等待解析的内容已到上限，ReasonForFailure 已设置
+                // 等待解析的内容已到上限，ReasonForFailure 已设置，与编码无关
+                return true;
             }
             parsedLength = chunkBuilder.Length;   // 解析后缓冲已变短，按当前长度重新计时
         }
@@ -396,11 +514,9 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
             // 否则被留给下一块补全的最后一行会因为没有下一块而永远得不到解析
             this.ExtendChecklistWithChunk(chunkBuilder, parserSession, isLastChunk: true);
         }
-        // 走到这里说明方案列表不为空（为空时已在开头返回）：没有任何方案匹配上内容时给出提示
-        if (!parserSession.HasSettled)
-        {
-            this.ReasonForFailure = "没有解析到校验信息，请检查解析方案或校验信息文件内容。";
-        }
+        // 一条都没解析出来，多半是编码猜错了（例如无 BOM 的 UTF-16LE 被 UTF-8 读成
+        // 一串含 NUL 的字符），返回 false 让调用方换下一个编码重试
+        return parserSession.HasSettled;
     }
 
     /// <summary>
@@ -540,8 +656,22 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
 
     public string UpdateWithChecklist(HashChecklist checklist)
     {
-        this.fileHashCheckerDict = checklist.fileHashCheckerDict;
+        if (checklist == null)
+        {
+            this.Initialize();
+            this.ReasonForFailure = "校验信息清单为空，无法复制。";
+            return this.ReasonForFailure;
+        }
+        if (ReferenceEquals(checklist, this))
+        {
+            return this.ReasonForFailure;
+        }
+        // 沿用所有权转移语义（避免复制整份字典），同时保证：
+        // 源尚未初始化过字典时，本对象得到的是空字典而不是 null
+        this.fileHashCheckerDict = checklist.fileHashCheckerDict ??
+            new Dictionary<string, HashChecker>(StringComparer.OrdinalIgnoreCase);
         this.AlgoTypesFromOption = checklist.AlgoTypesFromOption;
+        this.AlgoTypeFromFileExt = checklist.AlgoTypeFromFileExt;
         this.ReasonForFailure = checklist.ReasonForFailure;
         this.KeysAreRelativePaths = checklist.KeysAreRelativePaths;
         checklist.fileHashCheckerDict = null;
@@ -551,30 +681,67 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
 
     public bool TryGetFileHashChecker(string mapKey, out HashChecker checker)
     {
-        if (mapKey != null)
-        {
-            if (!this.KeysAreRelativePaths)
-            {
-                mapKey = Path.GetFileName(mapKey);
-            }
-            return this.fileHashCheckerDict.TryGetValue(mapKey, out checker);
-        }
         checker = null;
-        return false;
+        if (mapKey == null)
+        {
+            return false;
+        }
+        if (!this.KeysAreRelativePaths)
+        {
+            mapKey = Path.GetFileName(mapKey);
+        }
+        if (this.FileHashCheckerDict.TryGetValue(mapKey, out checker))
+        {
+            return true;
+        }
+        // 清单里记的是纯文件名（如【文件名+制表符+哈希值】导出方案），
+        // 即使被判定为相对路径清单，也要能用文件名匹配到子目录里的文件
+        return this.KeysAreRelativePaths &&
+            this.FileHashCheckerDict.TryGetValue(Path.GetFileName(mapKey), out checker);
     }
 
     public bool TryGetFileOrEmptyStrHashChecker(string mapKey, out HashChecker checker)
     {
-        if (mapKey != null && this.fileHashCheckerDict.Count != 0)
-        {
-            if (!this.KeysAreRelativePaths)
-            {
-                mapKey = Path.GetFileName(mapKey);
-            }
-            return this.fileHashCheckerDict.TryGetValue(mapKey, out checker)
-                || this.fileHashCheckerDict.TryGetValue(string.Empty, out checker);
-        }
         checker = null;
+        if (mapKey == null || this.FileHashCheckerDict.Count == 0)
+        {
+            return false;
+        }
+        if (!this.KeysAreRelativePaths)
+        {
+            mapKey = Path.GetFileName(mapKey);
+        }
+        if (this.FileHashCheckerDict.TryGetValue(mapKey, out checker))
+        {
+            return true;
+        }
+        if (this.KeysAreRelativePaths &&
+            this.FileHashCheckerDict.TryGetValue(Path.GetFileName(mapKey), out checker))
+        {
+            return true;
+        }
+        // 无文件名的纯哈希清单：对每一行都适用
+        return this.FileHashCheckerDict.TryGetValue(string.Empty, out checker);
+    }
+
+    /// <summary>
+    /// 校验清单里的文件标识必须是安全的相对路径：拒绝绝对路径、盘符、含 ".." 的回退路径。
+    /// 否则 Path.Combine 会丢弃 rootDir，程序会去计算清单目录之外的文件。
+    /// </summary>
+    private static bool IsUnsafeRelativeKey(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key) || Path.IsPathRooted(key) ||
+            key[0] == '\\' || key[0] == '/' || key.IndexOf(':') >= 0)
+        {
+            return true;
+        }
+        foreach (string part in key.Split(directorySeparators))
+        {
+            if (part == "..")
+            {
+                return true;
+            }
+        }
         return false;
     }
 
@@ -583,38 +750,44 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
     /// </summary>
     public bool AssertRelativeGetFull(string rootDir, out IEnumerable<string> fullPaths)
     {
-        if (!string.IsNullOrWhiteSpace(rootDir) && this.fileHashCheckerDict.Count != 0)
+        fullPaths = null;
+        if (string.IsNullOrWhiteSpace(rootDir) || this.FileHashCheckerDict.Count == 0 ||
+            this.FileHashCheckerDict.Keys.Any(IsUnsafeRelativeKey))
+        {
+            return false;
+        }
+        try
         {
             // 如果所有 Key 都不含 "\" 或 "/" 则进一步判断是否是相对路径
-            if (!this.fileHashCheckerDict.Keys.Any(i => i.IndexOfAny(directorySeparators) != -1))
+            if (!this.FileHashCheckerDict.Keys.Any(i => i.IndexOfAny(directorySeparators) != -1))
             {
                 List<string> filePathList = new List<string>();
-                foreach (KeyValuePair<string, HashChecker> pair in this.fileHashCheckerDict)
+                foreach (KeyValuePair<string, HashChecker> pair in this.FileHashCheckerDict)
                 {
                     string filePath = Path.Combine(rootDir, pair.Key);
                     if (!System.IO.File.Exists(filePath))
                     {
-                        // 如果有一个路径找不到文件，则视所有 Key 为非相对路径，
-                        // 返回 false 和 null 结果，意味着调用者需要自行枚举文件找到目标
-                        fullPaths = null;
+                        // 有一个路径找不到文件，则视所有 Key 为非相对路径，
+                        // 调用者需要自行枚举文件找到目标
                         return false;
                     }
                     filePathList.Add(filePath);
                 }
-                // 如果所有 Key 与 parentDir 连接都能找到文件，也视所有 Key 为相对路径
                 fullPaths = filePathList;
                 this.KeysAreRelativePaths = true;
                 return true;
             }
             // 只要某个 Key 含有一个 "\" 或 "/" 则视所有 Key 为相对路径，不管文件是否存在
-            else
-            {
-                fullPaths = this.fileHashCheckerDict.Keys.Select(rel => Path.Combine(rootDir, rel));
-                this.KeysAreRelativePaths = true;
-                return true;
-            }
+            fullPaths = this.FileHashCheckerDict.Keys
+                .Select(rel => Path.Combine(rootDir, rel)).ToArray();
+            this.KeysAreRelativePaths = true;
+            return true;
         }
-        fullPaths = null;
-        return false;
+        catch (Exception ex) when (ex is ArgumentException ||
+            ex is NotSupportedException || ex is PathTooLongException)
+        {
+            // 文件名含通配符等非法字符时 Path.Combine / File.Exists 可能抛异常
+            return false;
+        }
     }
 }

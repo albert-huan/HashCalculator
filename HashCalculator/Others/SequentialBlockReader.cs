@@ -1,7 +1,10 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace HashCalculator;
 
@@ -365,22 +368,38 @@ internal sealed class SequentialBlockReader : IDisposable
             return;
         }
         this._disposed = true;
-        if (this._handle != IntPtr.Zero && this._handle != HANDLE.INVALID_HANDLE_VALUE)
+        bool handleValid = this._handle != IntPtr.Zero &&
+            this._handle != HANDLE.INVALID_HANDLE_VALUE;
+        List<IntPtr> pendingEvents = new List<IntPtr>();
+        if (handleValid)
         {
             // CancelIoEx 是异步取消：必须等这些读真正完成（完成通知照常触发）后才能释放
             // OVERLAPPED 内存与缓冲，否则内核可能仍在写已释放的内存。
-            // 所有在途槽共享一个等待预算，避免多个槽各自超时导致 Dispose 卡上数倍的超时时间
+            // 所有在途槽共享一个等待预算，避免多个槽各自超时导致 Dispose 卡上数倍时间
             _ = KERNEL32.CancelIoEx(this._handle, IntPtr.Zero);
             long deadline = Environment.TickCount64 + DisposeWaitTimeout;
+            bool timedOut = false;
             for (long i = this._consumed; i < this._submitted; ++i)
             {
-                long remaining = deadline - Environment.TickCount64;
-                if (remaining <= 0)
-                {
-                    break;
-                }
                 int slot = (int)(i % SlotCount);
-                _ = KERNEL32.WaitForSingleObject(this._completionEvents[slot], (uint)remaining);
+                if (!timedOut)
+                {
+                    long remaining = deadline - Environment.TickCount64;
+                    // 0 才是 WAIT_OBJECT_0；超时或失败都说明这次读尚未完成
+                    if (remaining <= 0 || KERNEL32.WaitForSingleObject(
+                        this._completionEvents[slot], (uint)remaining) != 0)
+                    {
+                        timedOut = true;
+                    }
+                }
+                if (timedOut)
+                {
+                    IntPtr completionEvent = this._completionEvents[slot];
+                    if (completionEvent != IntPtr.Zero && !pendingEvents.Contains(completionEvent))
+                    {
+                        pendingEvents.Add(completionEvent);
+                    }
+                }
             }
             KERNEL32.CloseHandle(this._handle);
         }
@@ -388,6 +407,20 @@ internal sealed class SequentialBlockReader : IDisposable
         {
             KERNEL32.CloseHandle(this._tailHandle);
         }
+        if (pendingEvents.Count == 0)
+        {
+            this.ReleaseNativeResources();
+        }
+        else
+        {
+            // 仍有在途读：绝不能在内核可能还在写 OVERLAPPED / 固定缓冲时释放它们，
+            // 否则是 use-after-free。交给后台线程等完成通知到达后再释放。
+            this.DeferReleaseNativeResources(pendingEvents);
+        }
+    }
+
+    private void ReleaseNativeResources()
+    {
         foreach (IntPtr completionEvent in this._completionEvents)
         {
             if (completionEvent != IntPtr.Zero)
@@ -399,5 +432,35 @@ internal sealed class SequentialBlockReader : IDisposable
         {
             Marshal.FreeHGlobal(this._overlapped);
         }
+        GC.KeepAlive(this._buffer);
+    }
+
+    private void DeferReleaseNativeResources(List<IntPtr> pendingEvents)
+    {
+        IntPtr[] events = (IntPtr[])this._completionEvents.Clone();
+        IntPtr[] pending = pendingEvents.ToArray();
+        IntPtr overlapped = this._overlapped;
+        // 闭包持有固定缓冲，避免 GC 在异步读完成前回收它
+        byte[] buffer = this._buffer;
+        _ = Task.Factory.StartNew(() =>
+        {
+            foreach (IntPtr completionEvent in pending)
+            {
+                // 事件是手动复位的，取消的在途读完成时会被置位
+                KERNEL32.WaitForSingleObject(completionEvent, Infinite);
+            }
+            foreach (IntPtr completionEvent in events)
+            {
+                if (completionEvent != IntPtr.Zero)
+                {
+                    KERNEL32.CloseHandle(completionEvent);
+                }
+            }
+            if (overlapped != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(overlapped);
+            }
+            GC.KeepAlive(buffer);
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 }

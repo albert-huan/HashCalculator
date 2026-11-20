@@ -10,6 +10,9 @@ public class AlgoInOutModel : BaseViewModel
 {
     private CmpRes _hashCmpResult;
     private byte[] _hashResult;
+    private string _expectedHashString = null;
+    private byte[] _expectedBytes = null;
+    private bool _expectedFromChecklist = false;
     private bool _export = false;
     private bool _selected = false;
     private string _algorithmAlias = null;
@@ -99,7 +102,102 @@ public class AlgoInOutModel : BaseViewModel
     public byte[] HashResult
     {
         get => this._hashResult;
-        set => this.SetPropNotify(ref this._hashResult, value);
+        set
+        {
+            if (this._hashResult == value)
+            {
+                return;
+            }
+            this._hashResult = value;
+            this.NotifyPropertyChanged();
+            // 不在此处比对：计算结束后由 HashViewModel.ApplyHashCmpResult 统一按
+            // 清单语义或手填值语义判定，避免中途用二元结论覆盖清单的判定结果
+        }
+    }
+
+    /// <summary>
+    /// 用户手动填入（或由校验信息清单回填）的期望哈希值。<br/>
+    /// 与 <see cref="HashResult"/> 同时存在时实时比对并更新 <see cref="HashCmpResult"/>，
+    /// 使校验结果列在填写/修改后立即反映匹配情况。
+    /// </summary>
+    public string ExpectedHashString
+    {
+        get => this._expectedHashString;
+        set
+        {
+            if (this._expectedHashString == value)
+            {
+                return;
+            }
+            this._expectedHashString = value;
+            // 用户手填的值保持原样：不随输出方式重排，也不被清单回填的字节覆盖
+            this._expectedBytes = null;
+            this._expectedFromChecklist = false;
+            this.NotifyPropertyChanged();
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                // 用户清空了本行期望值，对应的校验结果也应清除
+                this.HashCmpResult = CmpRes.NoResult;
+            }
+            else
+            {
+                this.RefreshCmpResultFromExpected();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 用期望哈希值与已算出的结果重新比对，刷新校验结果。<br/>
+    /// 期望值为空或结果尚未算出时不改动既有结果（可能来自清单判定），
+    /// 初始态本身就是 <see cref="CmpRes.NoResult"/>。
+    /// </summary>
+    public void RefreshCmpResultFromExpected()
+    {
+        if (string.IsNullOrWhiteSpace(this._expectedHashString) || this.HashResult == null)
+        {
+            return;
+        }
+        byte[] expected = CommonUtils.HashBytesFromString(
+            this._expectedHashString, this.HashResult.Length);
+        this.HashCmpResult = expected != null &&
+            BytesComparer.Default.Equals(expected, this.HashResult) ?
+            CmpRes.Matched : CmpRes.Mismatch;
+    }
+
+    /// <summary>
+    /// 由校验清单写入期望值与比对结论：按当前输出方式格式化显示文本，
+    /// 不触发手填值的二元比对（结论已由 HashChecker 判定）。
+    /// </summary>
+    internal void SetExpectedAndResult(byte[] expected, CmpRes result, OutputType outputType)
+    {
+        this._expectedBytes = expected;
+        this._expectedFromChecklist = expected != null;
+        string text = expected == null ? null :
+            BytesToStrByOutputTypeCvt.Convert(expected, outputType);
+        if (this._expectedHashString != text)
+        {
+            this._expectedHashString = text;
+            this.NotifyPropertyChanged();
+        }
+        this.HashCmpResult = result;
+    }
+
+    /// <summary>
+    /// 输出方式改变后，只重排由清单回填的期望值，用户手填的内容保持原样，
+    /// 避免正在输入的文本被反复改写。
+    /// </summary>
+    internal void RefreshExpectedStringFormat(OutputType outputType)
+    {
+        if (!this._expectedFromChecklist || this._expectedBytes == null)
+        {
+            return;
+        }
+        string text = BytesToStrByOutputTypeCvt.Convert(this._expectedBytes, outputType);
+        if (this._expectedHashString != text)
+        {
+            this._expectedHashString = text;
+            this.NotifyPropertyChanged();
+        }
     }
 
     public CmpRes HashCmpResult
@@ -146,7 +244,9 @@ public class AlgoInOutModel : BaseViewModel
     /// </summary>
     public AlgoInOutModel NewAlgoInOutModel()
     {
-        return new AlgoInOutModel(this._algoInfo, this.AlgorithmAlias, this._defaultAlias);
+        // 构造签名为 (algoInfo, defaultAlias, alias)：克隆继承模板当前的别名，
+        // 默认别名仍是原始默认值，ResetAlias 才能重置回默认别名
+        return new AlgoInOutModel(this._algoInfo, this._defaultAlias, this.AlgorithmAlias);
     }
 
     /// <summary>
@@ -195,13 +295,38 @@ public class AlgoInOutModel : BaseViewModel
         }
     }
 
+    /// <summary>CSV 字段转义：包双引号、双引号翻倍，并阻止表格软件把值当公式执行。</summary>
+    private static string EscapeCsvValue(string value)
+    {
+        value ??= string.Empty;
+        if (value.Length > 0 && (value[0] == '=' || value[0] == '+' ||
+            value[0] == '-' || value[0] == '@' || value[0] == '\t' || value[0] == '\r'))
+        {
+            value = "'" + value;
+        }
+        return "\"" + value.Replace("\"", "\"\"") + "\"";
+    }
+
+    /// <summary>导出方案与 Word 表格共用的校验结果显示文本：一致 / 不一致 等。</summary>
+    internal static string CmpResultToExportText(CmpRes result)
+    {
+        return result switch
+        {
+            CmpRes.Matched => "一致",
+            CmpRes.Mismatch => "不一致",
+            CmpRes.Uncertain => "不确定",
+            CmpRes.Unrelated => "无关联",
+            _ => "未校验",
+        };
+    }
+
     /// <summary>
     /// 参数 format 为 null 或空字符串代表不按格式生成字符串。<br/>
     /// 参数 output 为 OutputType.Unknown 代表按 parent.SelectedOutputType 格式化哈希值，<br/>
     /// 如果 parent.SelectedOutputType 也是 OutputType.Unknown，则使用 Settings.Current.SelectedOutputType。
     /// </summary>
     internal string GenerateTextInFormat(HashViewModel parent, string format, OutputType output,
-        bool endLine, bool seeExport, bool casedAlgName)
+        bool endLine, bool seeExport, bool casedAlgName, bool escapeCsv = false)
     {
         if (parent != null && !parent.Arguments.IsInvalidName && this.HashResult != null &&
             (!seeExport || this.Export))
@@ -234,21 +359,27 @@ public class AlgoInOutModel : BaseViewModel
                         _ => algoName.ToUpper(),
                     };
                 }
-                StringBuilder formatBuilder = new StringBuilder(format);
-                if (endLine)
-                {
-                    formatBuilder.Append(lineBreak);
-                }
-                formatBuilder.Replace("$horztab$", "\t");
-                formatBuilder.Replace("$newline$", lineBreak);
-                formatBuilder.Replace("$algo$", algoName);
-                formatBuilder.Replace("$hash$", BytesToStrByOutputTypeCvt.Convert(this.HashResult, output));
-                formatBuilder.Replace("$name$", parent.Information.Name);
-                formatBuilder.Replace("$path$", parent.Arguments.Deprecated ?
-                    parent.Information.Name : parent.Information.FullName);
-                formatBuilder.Replace("$relpath$", parent.RelativePath);
-                formatBuilder.Replace("$filesize$", parent.FileLength.ToString());
-                return formatBuilder.ToString();
+                // 一次性扫描替换：串行的 StringBuilder.Replace 会把文件名/路径里
+                // 字面的 $path$ 等占位符当成模板再替换一次
+                string CsvField(string value) => escapeCsv ? EscapeCsvValue(value) : value;
+                string text = System.Text.RegularExpressions.Regex.Replace(format,
+                    "\\$(?:horztab|newline|algo|hash|name|path|relpath|filesize|expected|cmp)\\$",
+                    match => match.Value switch
+                    {
+                        "$horztab$" => "\t",
+                        "$newline$" => lineBreak,
+                        "$algo$" => CsvField(algoName),
+                        "$hash$" => CsvField(BytesToStrByOutputTypeCvt.Convert(this.HashResult, output)),
+                        "$name$" => CsvField(parent.Information.Name),
+                        "$path$" => CsvField(parent.Arguments.Deprecated ?
+                            parent.Information.Name : parent.Information.FullName),
+                        "$relpath$" => CsvField(parent.RelativePath),
+                        "$filesize$" => CsvField(parent.FileLength.ToString()),
+                        "$expected$" => CsvField(this.ExpectedHashString ?? string.Empty),
+                        "$cmp$" => CsvField(CmpResultToExportText(this.HashCmpResult)),
+                        _ => match.Value,
+                    });
+                return endLine ? text + lineBreak : text;
             }
         }
         return default(string);

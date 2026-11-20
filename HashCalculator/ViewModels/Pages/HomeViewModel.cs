@@ -42,6 +42,7 @@ public class HomeViewModel : BaseViewModel
     private RelayCommand forceRefreshOriginalModelsCmd;
     private RelayCommand selectChecklistFileCmd;
     private RelayCommand startCheckHashResultsCmd;
+    private RelayCommand clearExpectedHashValuesCmd;
     private RelayCommand selectFilesToHashCmd;
     private RelayCommand selectFoldersToHashCmd;
     private RelayCommand cancelDisplayedModelsCmd;
@@ -60,6 +61,9 @@ public class HomeViewModel : BaseViewModel
     private RelayCommand copyFormattedModelsHashesCmd;
     private RelayCommand copyUnformattedModelsHashCmd;
     private RelayCommand copyUnformattedModelsHashesCmd;
+    private RelayCommand copyNameHashTableCmd;
+    private RelayCommand copyVerifyTableCmd;
+    private IReadOnlyList<HashViewModel> selectedModelsForTable;
     private RelayCommand displayMainWindowButtonsCmd;
     private RelayCommand openFilterOperationWindowCmd;
 
@@ -76,15 +80,42 @@ public class HomeViewModel : BaseViewModel
         this.FilterAndOperationModel = model;
         this.JobScheduler = new JobScheduler(Settings.Current.SelectedTaskNumberLimit);
         this.JobScheduler.JobStatusChanged += status =>
-        {
-            Synchronization.UI.Invoke(() => { this.BatchStatus = status; });
-        };
+            RunOnUiThread(() => this.BatchStatus = status);
         this.JobScheduler.PendingCountChanged += count =>
-        {
-            Synchronization.UI.Invoke(() => { this.PendingModelsCount = count; });
-        };
+            RunOnUiThread(() => this.PendingModelsCount = count);
         // 算法被重新排序后，缓存的分组算法菜单需要重建以跟随新顺序
         AlgorithmsModel.AlgoOrderChanged += this.InvalidateAlgoCmds;
+    }
+
+    /// <summary>
+    /// 调度器事件可能由非界面线程发布，此处绝不能用阻塞式 Dispatcher.Invoke，
+    /// 否则发布方持锁等界面线程、界面线程又在等同一把锁时会互等死锁。
+    /// 界面线程上同步执行以保持状态即时，其它线程只投递不等待。
+    /// </summary>
+    private static void RunOnUiThread(Action action)
+    {
+        if (Synchronization.UI.CheckAccess())
+        {
+            // 调度器的状态上报都发生在界面线程的 Tick，此同步路径的异常由
+            // TryRaise 捕获并触发重试，不能在此吞掉
+            action();
+        }
+        else
+        {
+            // 防御性通道：状态上报已收敛到界面线程，正常不会走到这里。
+            // 仍须拦下异常，避免它变成 Dispatcher 未处理异常
+            Synchronization.UI.BeginInvoke(() =>
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception)
+                {
+                    // 异步路径不承载可重试的状态上报，拦下即可
+                }
+            });
+        }
     }
 
     private void InvalidateAlgoCmds()
@@ -177,7 +208,9 @@ public class HomeViewModel : BaseViewModel
     }
 
     /// <summary>
-    /// 检查剪贴板字符，在符合要求时把它设置到主窗口的校验信息输入框内
+    /// 检查剪贴板字符并解析为校验信息清单。<br/>
+    /// 注意：这里不再改写 HashStringOrChecklistPath —— 底部输入框由用户掌控，
+    /// 否则每次复制合法哈希都会清空用户已填的内容。
     /// </summary>
     public HashChecklist TestClipboardTextGetChecklist()
     {
@@ -188,7 +221,6 @@ public class HomeViewModel : BaseViewModel
             HashChecklist checklist = File.Exists(text) ? HashChecklist.File(text) : HashChecklist.Text(text);
             if (checklist.ReasonForFailure == null)
             {
-                this.HashStringOrChecklistPath = text;
                 return checklist;
             }
         }
@@ -539,7 +571,9 @@ public class HomeViewModel : BaseViewModel
             }
             if (stringBuilder.Length > 0)
             {
-                stringBuilder.Remove(stringBuilder.Length - 1, 1);
+                int breakLength = Math.Min(Settings.Current.UseUnixStyleLineBreaks ? 1 : 2,
+                    stringBuilder.Length);
+                stringBuilder.Remove(stringBuilder.Length - breakLength, breakLength);
                 CommonUtils.ClipboardSetText(stringBuilder.ToString());
                 NotificationSender.SnackbarSuccess($"已按模板复制所选行的当前结果或全部结果");
             }
@@ -581,7 +615,9 @@ public class HomeViewModel : BaseViewModel
             }
             if (stringBuilder.Length > 0)
             {
-                stringBuilder.Remove(stringBuilder.Length - 1, 1);
+                int breakLength = Math.Min(Settings.Current.UseUnixStyleLineBreaks ? 1 : 2,
+                    stringBuilder.Length);
+                stringBuilder.Remove(stringBuilder.Length - breakLength, breakLength);
                 CommonUtils.ClipboardSetText(stringBuilder.ToString());
                 NotificationSender.SnackbarSuccess("已复制所选行的当前哈希值或全部哈希值");
             }
@@ -605,6 +641,107 @@ public class HomeViewModel : BaseViewModel
             this.copyUnformattedModelsHashesCmd ??= new RelayCommand(
                 param => this.CopyUnformattedModelsHashAction(param, OutputType.Unknown, copyAll: true));
             return this.copyUnformattedModelsHashesCmd;
+        }
+    }
+
+    /// <summary>
+    /// 复制可直接粘贴成 Word 表格的清单：发送方只要文件名与哈希值，接收方额外带上
+    /// 校验值与校验结果。表格不带算法列，固定只取各行当前显示的算法。<br/>
+    /// 未选中任何行时按表格当前视图的全部行复制（跟随筛选与排序结果）。
+    /// </summary>
+    private void CopyWordTableAction(object param, bool forReceiver)
+    {
+        IEnumerable<HashViewModel> models;
+        bool selectedUsed;
+        if (param is IList selectedModels && selectedModels.Count > 0)
+        {
+            models = selectedModels.Cast<HashViewModel>();
+            selectedUsed = true;
+        }
+        else if (this.SelectedModelsForTable?.Count > 0)
+        {
+            // 子菜单的 RelativeSource 绑定可能拿不到 SelectedItems，用菜单打开时的快照兜底
+            models = this.SelectedModelsForTable;
+            selectedUsed = true;
+        }
+        else
+        {
+            models = HashModelStore.HashViewModelsView.Cast<HashViewModel>();
+            selectedUsed = false;
+        }
+        string[] headers = forReceiver ?
+            new[] { "文件名", "哈希值", "校验值", "校验结果" } :
+            new[] { "文件名", "哈希值" };
+        List<string[]> rows = new List<string[]>();
+        foreach (HashViewModel model in models)
+        {
+            // 与界面【哈希值】列同源：按行自己的输出方式格式化，未算出结果时为 null
+            string hash = model.CurrentHashString;
+            if (!forReceiver && string.IsNullOrEmpty(hash))
+            {
+                // 发送清单只放已经算出的结果，避免把空哈希值发给对方
+                continue;
+            }
+            string fileName = model.Information.Name;
+            if (!forReceiver)
+            {
+                rows.Add(new[] { fileName, hash });
+                continue;
+            }
+            AlgoInOutModel current = model.CurrentInOutModel;
+            rows.Add(new[]
+            {
+                fileName,
+                string.IsNullOrEmpty(hash) ? "—" : hash,
+                string.IsNullOrWhiteSpace(current?.ExpectedHashString) ? "—" : current.ExpectedHashString,
+                AlgoInOutModel.CmpResultToExportText(current?.HashCmpResult ?? CmpRes.NoResult),
+            });
+        }
+        if (rows.Count == 0)
+        {
+            NotificationSender.SnackbarWarning("没有可复制的哈希结果。");
+            return;
+        }
+        WordTableClipboard.Build(headers, rows, out string plainText, out string html);
+        if (!CommonUtils.ClipboardSetTable(plainText, html, out bool richTableCopied))
+        {
+            // 失败原因已由剪贴板底层提示
+            return;
+        }
+        string scope = selectedUsed ? "所选行" : "全部行";
+        NotificationSender.SnackbarSuccess(richTableCopied ?
+            $"已按{scope}复制 {rows.Count} 行表格，可直接粘贴到 Word。" :
+            $"已按{scope}复制 {rows.Count} 行纯文本表格（Word 中可使用“文本转换成表格”）。");
+    }
+
+    /// <summary>
+    /// 右键菜单打开时由界面直接同步的选中行快照，避免子菜单跨层绑定失效时退化为复制全部行。
+    /// </summary>
+    public IReadOnlyList<HashViewModel> SelectedModelsForTable
+    {
+        get => this.selectedModelsForTable;
+        set => this.selectedModelsForTable = value;
+    }
+
+    /// <summary>发送方：复制文件名 + 哈希值表格。</summary>
+    public ICommand CopyNameHashTableCmd
+    {
+        get
+        {
+            this.copyNameHashTableCmd ??= new RelayCommand(
+                param => this.CopyWordTableAction(param, forReceiver: false));
+            return this.copyNameHashTableCmd;
+        }
+    }
+
+    /// <summary>接收方：复制文件名 + 哈希值 + 校验值 + 校验结果表格。</summary>
+    public ICommand CopyVerifyTableCmd
+    {
+        get
+        {
+            this.copyVerifyTableCmd ??= new RelayCommand(
+                param => this.CopyWordTableAction(param, forReceiver: true));
+            return this.copyVerifyTableCmd;
         }
     }
 
@@ -1015,12 +1152,12 @@ public class HomeViewModel : BaseViewModel
             if (Settings.Current.EachAlgoExportedToSeparateFile)
             {
                 this.EachAlgoExportedToSeparateFile(saveFileDialog.FileName, encoding,
-                    model.Template, output);
+                    model.Template, output, model.EscapeCsvValues);
             }
             else
             {
                 this.AlgorithmResultsExportedToSameFile(saveFileDialog.FileName, encoding,
-                    model.Template, output, all);
+                    model.Template, output, all, model.EscapeCsvValues);
             }
         }
         catch (Exception ex)
@@ -1030,7 +1167,7 @@ public class HomeViewModel : BaseViewModel
     }
 
     private void EachAlgoExportedToSeparateFile(string file, Encoding encoding, string format,
-        OutputType output)
+        OutputType output, bool escapeCsv)
     {
         Dictionary<AlgoType, string> algoTypes = new Dictionary<AlgoType, string>();
         List<HashViewModel> validHashViews = new List<HashViewModel>();
@@ -1107,7 +1244,7 @@ public class HomeViewModel : BaseViewModel
                         if (inOutModel.AlgoType == keyValuePair.Key)
                         {
                             if (inOutModel.GenerateTextInFormat(hashView, format, output, endLine: true,
-                            seeExport: true, casedAlgName: false) is string text)
+                            seeExport: true, casedAlgName: false, escapeCsv: escapeCsv) is string text)
                             {
                                 streamWriter.Write(text);
                             }
@@ -1120,7 +1257,7 @@ public class HomeViewModel : BaseViewModel
     }
 
     private void AlgorithmResultsExportedToSameFile(string file, Encoding encoding,
-        string format, OutputType output, bool all)
+        string format, OutputType output, bool all, bool escapeCsv)
     {
         using (FileStream fileStream = File.Create(file))
         using (StreamWriter streamWriter = new StreamWriter(fileStream, encoding))
@@ -1129,7 +1266,7 @@ public class HomeViewModel : BaseViewModel
                 .Where(i => i.Result == HashResult.Succeeded))
             {
                 if (hm.GenerateTextInFormat(format, output, all, endLine: true, seeExport: true,
-                    casedName: false) is string text)
+                    casedName: false, escapeCsv: escapeCsv) is string text)
                 {
                     streamWriter.Write(text);
                 }
@@ -1203,18 +1340,25 @@ public class HomeViewModel : BaseViewModel
         }
     }
 
-    private void GenerateOriginFileHashCheckReport()
+    private void ClearAllExpectedHashValues()
     {
         foreach (HashViewModel hm in HashModelStore.HashViewModels)
         {
+            hm.ForgetAppliedChecklist();
             if (hm.AlgoInOutModels != null)
             {
                 foreach (AlgoInOutModel model in hm.AlgoInOutModels)
                 {
+                    model.ExpectedHashString = null;
                     model.HashCmpResult = CmpRes.NoResult;
                 }
             }
         }
+    }
+
+    private void GenerateOriginFileHashCheckReport()
+    {
+        this.ClearAllExpectedHashValues();
         this.GenerateFileHashCheckReport();
     }
 
@@ -1225,9 +1369,14 @@ public class HomeViewModel : BaseViewModel
         {
             if (string.IsNullOrEmpty(this.HashStringOrChecklistPath))
             {
-                this.GenerateOriginFileHashCheckReport();
-                NotificationSender.SnackbarWarning("校验信息输入框没有任何内容！");
-                return false;
+                // 底部输入框为空时按各行【校验值】列已填的期望值重新比对，
+                // 而不是清空它们；这样手动填入 + 点〈校验〉即可完成整表校验。
+                foreach (HashViewModel model in HashModelStore.HashViewModels)
+                {
+                    model.RefreshCmpResultFromExpected();
+                }
+                this.GenerateFileHashCheckReport();
+                return true;
             }
             // HashStringOrChecklistPath 不是一个文件
             if (!File.Exists(this.HashStringOrChecklistPath))
@@ -1237,7 +1386,11 @@ public class HomeViewModel : BaseViewModel
             // HashStringOrChecklistPath 是一个文件，但哈希结果列表不是空
             else if (HashModelStore.HashViewModels.Any())
             {
-                localChecklist = HashChecklist.File(this.HashStringOrChecklistPath);
+                // 清单没指明算法时按当前勾选算法补全 UNKNOWN 条目，使导出的
+                // 文件名<TAB>哈希值 清单读回后能正确判定「不匹配」，
+                // 也与命令行 verify 入口的解析结果保持一致
+                localChecklist = HashChecklist.File(this.HashStringOrChecklistPath,
+                    AlgorithmsModel.GetSelectedAlgos().Select(i => i.AlgoType));
                 try
                 {
                     string parent = Path.GetDirectoryName(this.HashStringOrChecklistPath);
@@ -1284,7 +1437,9 @@ public class HomeViewModel : BaseViewModel
         }
         else
         {
-            this.GenerateOriginFileHashCheckReport();
+            // 解析失败只是这次校验没成功，不应清空用户手填的【校验值】，
+            // 清空只由底部【清空】按钮负责
+            this.GenerateFileHashCheckReport();
             NotificationSender.SnackbarError(localChecklist.ReasonForFailure);
         }
         return localChecklist.ReasonForFailure == null;
@@ -1326,6 +1481,21 @@ public class HomeViewModel : BaseViewModel
         {
             this.startCheckHashResultsCmd ??= new RelayCommand(this.StartCheckHashResultsAction);
             return this.startCheckHashResultsCmd;
+        }
+    }
+
+    private void ClearExpectedHashValuesAction(object param)
+    {
+        this.HashStringOrChecklistPath = string.Empty;
+        this.GenerateOriginFileHashCheckReport();
+    }
+
+    public ICommand ClearExpectedHashValuesCmd
+    {
+        get
+        {
+            this.clearExpectedHashValuesCmd ??= new RelayCommand(this.ClearExpectedHashValuesAction);
+            return this.clearExpectedHashValuesCmd;
         }
     }
 

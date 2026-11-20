@@ -61,6 +61,17 @@ public class HashViewModel : BaseViewModel
     /// </summary>
     private readonly HashSet<AlgoType> _pendingTempAlgos = new HashSet<AlgoType>();
     private CancellationTokenSource cancellation;
+    /// <summary>
+    /// 本轮令牌源的回调注册句柄。每轮替换令牌源时先注销它，
+    /// 避免旧回调持有本模型引用、也避免反复重算时注册不断累积。
+    /// </summary>
+    private CancellationTokenRegistration cancellationRegistration;
+
+    /// <summary>
+    /// 最近一次用于判定的校验清单。重算时沿用它可以避免用「手填值」的二元结论
+    /// 覆盖清单的 不确定/无关联 语义；按手填值重新比对或点【清空】时会被清除。
+    /// </summary>
+    private HashChecklist appliedChecklist = null;
 
     /// <summary>
     /// 调度器期望本模型处于的状态。<br/>
@@ -267,7 +278,29 @@ public class HashViewModel : BaseViewModel
             this.SetPropNotify(ref this._selectedOutput, value);
             // 输出方式变了就按新格式重算当前显示行
             this.UpdateCurrentHashStringAction();
+            this.RefreshExpectedStringsFormat();
         }
+    }
+
+    /// <summary>输出方式改变后，同步重排由清单回填的【校验值】列文本。</summary>
+    private void RefreshExpectedStringsFormat()
+    {
+        if (this.AlgoInOutModels == null)
+        {
+            return;
+        }
+        OutputType output = this._selectedOutput == OutputType.Unknown ?
+            Settings.Current.SelectedOutputType : this._selectedOutput;
+        foreach (AlgoInOutModel model in this.AlgoInOutModels)
+        {
+            model.RefreshExpectedStringFormat(output);
+        }
+    }
+
+    /// <summary>放弃最近一次校验清单，之后重算只按各行手填的期望值比对。</summary>
+    public void ForgetAppliedChecklist()
+    {
+        this.appliedChecklist = null;
     }
 
     private void CopyThisModelCurHashAction(object param)
@@ -603,14 +636,20 @@ public class HashViewModel : BaseViewModel
         {
             this.FileLength = -1;
         }
-        this.cancellation = new CancellationTokenSource();
-        this.cancellation.Token.Register(() =>
+        // 原子替换为本轮的新令牌源，随后注销上一轮的回调注册并释放上一轮实例。
+        // 字段在任何时刻都指向未释放的完整实例，后台计算线程与取消请求不会读到半成品；
+        // 反复重算也不会再累积旧令牌源及其回调注册。
+        CancellationTokenSource previous = Interlocked.Exchange(
+            ref this.cancellation, new CancellationTokenSource());
+        this.cancellationRegistration.Dispose();
+        this.cancellationRegistration = this.cancellation.Token.Register(() =>
         {
             if (this.Result == HashResult.NoResult)
             {
                 this.Result = HashResult.Canceled;
             }
         });
+        previous?.Dispose();
     }
 
     /// <summary>
@@ -638,8 +677,24 @@ public class HashViewModel : BaseViewModel
         }
         if (algoTypes == null)
         {
-            this.AlgoInOutModels = new ObservableCollection<AlgoInOutModel>(
+            ObservableCollection<AlgoInOutModel> previous = this.AlgoInOutModels;
+            ObservableCollection<AlgoInOutModel> rebuilt = new ObservableCollection<AlgoInOutModel>(
                 AlgorithmsModel.GetSelectedAlgos());
+            if (previous != null)
+            {
+                // 重建算法集时按算法迁移用户手填的【校验值】，避免重算后全部丢失
+                foreach (AlgoInOutModel fresh in rebuilt)
+                {
+                    AlgoInOutModel old = previous.FirstOrDefault(m =>
+                        m.AlgoType == fresh.AlgoType &&
+                        !string.IsNullOrWhiteSpace(m.ExpectedHashString));
+                    if (old != null)
+                    {
+                        fresh.ExpectedHashString = old.ExpectedHashString;
+                    }
+                }
+            }
+            this.AlgoInOutModels = rebuilt;
         }
         else
         {
@@ -674,14 +729,36 @@ public class HashViewModel : BaseViewModel
 
     public void ShutdownModelWait()
     {
-        this.cancellation?.Cancel();
+        this.CancelCurrentComputation();
         this._manualPauseController.Set();
-        Monitor.Enter(this._hashComputationExclusiveLock);
-        if (this.State == HashState.NoState || this.State == HashState.Waiting)
+        if (Synchronization.UI.CheckAccess())
         {
-            this.State = HashState.Finished;
+            // 绝不能在 UI 线程阻塞等待计算线程的锁：计算线程持锁期间会同步回
+            // UI 线程更新状态，UI 线程被锁阻塞就再也派发不了，两边互等死锁
+            _ = Task.Run(this.WaitForComputationToStop);
+            return;
         }
-        Monitor.Exit(this._hashComputationExclusiveLock);
+        this.WaitForComputationToStop();
+    }
+
+    private void WaitForComputationToStop()
+    {
+        Monitor.Enter(this._hashComputationExclusiveLock);
+        try
+        {
+            // 界面绑定属性必须回到 UI 线程修改
+            Synchronization.UI.Invoke(() =>
+            {
+                if (this.State == HashState.NoState || this.State == HashState.Waiting)
+                {
+                    this.State = HashState.Finished;
+                }
+            });
+        }
+        finally
+        {
+            Monitor.Exit(this._hashComputationExclusiveLock);
+        }
     }
 
     /// <summary>
@@ -738,8 +815,29 @@ public class HashViewModel : BaseViewModel
     /// </summary>
     internal void RequestCancellation()
     {
-        this.cancellation?.Cancel();
+        this.CancelCurrentComputation();
         this._manualPauseController.Set();
+    }
+
+    /// <summary>
+    /// 取消本轮计算。用 Volatile.Read 取当前令牌源：新一轮会在 PrepareForRestartModel
+    /// 中原子替换并释放旧实例，取到的引用可能是刚被释放的那个，故对
+    /// ObjectDisposedException 容错——此时旧轮已结束，忽略即可。
+    /// </summary>
+    private void CancelCurrentComputation()
+    {
+        CancellationTokenSource source = Volatile.Read(ref this.cancellation);
+        if (source == null)
+        {
+            return;
+        }
+        try
+        {
+            source.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     /// <summary>
@@ -770,8 +868,16 @@ public class HashViewModel : BaseViewModel
     /// <param name="checklist">用于比对的校验清单。</param>
     public void ApplyHashCmpResult(HashChecklist checklist)
     {
-        if (checklist == null || this.AlgoInOutModels == null)
+        if (this.AlgoInOutModels == null)
         {
+            return;
+        }
+        // 清单为空时按各行填写的期望值比对；非空时由 HashChecker 一次性写入
+        // 期望值与结论，保证【校验值】列和【校验结果】列使用同一套判定。
+        this.appliedChecklist = checklist;
+        if (checklist == null)
+        {
+            this.RefreshCmpResultFromExpected();
             return;
         }
         if (this.Result != HashResult.Succeeded)
@@ -782,17 +888,53 @@ public class HashViewModel : BaseViewModel
             }
             return;
         }
+        OutputType output = this.SelectedOutputType == OutputType.Unknown ?
+            Settings.Current.SelectedOutputType : this.SelectedOutputType;
         if (checklist.TryGetFileOrEmptyStrHashChecker(this.RelativePath, out HashChecker checker))
         {
-            checker.SetComparisonResult(this);
+            checker.ApplyTo(this, output);
         }
         else
         {
             foreach (AlgoInOutModel model in this.AlgoInOutModels)
             {
-                model.HashCmpResult = CmpRes.Unrelated;
+                model.SetExpectedAndResult(null, CmpRes.Unrelated, output);
             }
         }
+        this.SwitchCurrentAlgoIfNeeded();
+    }
+
+    /// <summary>
+    /// 逐算法用用户填写的期望校验值重新比对并刷新校验结果。<br/>
+    /// 走到这里说明本行改按手填值判定，故放弃此前的清单语义。
+    /// </summary>
+    public void RefreshCmpResultFromExpected()
+    {
+        this.appliedChecklist = null;
+        if (this.AlgoInOutModels == null)
+        {
+            return;
+        }
+        bool resultSucceeded = this.Result == HashResult.Succeeded;
+        foreach (AlgoInOutModel model in this.AlgoInOutModels)
+        {
+            if (resultSucceeded)
+            {
+                model.RefreshCmpResultFromExpected();
+            }
+            else
+            {
+                model.HashCmpResult = CmpRes.NoResult;
+            }
+        }
+        this.SwitchCurrentAlgoIfNeeded();
+    }
+
+    /// <summary>
+    /// 命中 AlgoToSwitchToAfterHashChecked 指定结果时，把当前显示算法切到该算法。
+    /// </summary>
+    private void SwitchCurrentAlgoIfNeeded()
+    {
         if (Settings.Current.AlgoToSwitchToAfterHashChecked != CmpRes.NoResult)
         {
             foreach (AlgoInOutModel model in this.AlgoInOutModels)
@@ -842,10 +984,14 @@ public class HashViewModel : BaseViewModel
         Stopwatch stopwatch = null;
         bool usesBlockReader = false;
         string blockReaderFailure = null;
+        // 本轮令牌源做一次局部快照：整轮计算只认这一个实例。
+        // 新一轮会在 PrepareForRestartModel 中原子替换并释放旧实例，若此处反复读字段，
+        // 旧线程可能读到新令牌（本轮的取消对它失效）或已释放的实例。
+        CancellationTokenSource cancellation = Volatile.Read(ref this.cancellation);
         Monitor.Enter(this._hashComputationExclusiveLock);
         try
         {
-            if (this.cancellation.IsCancellationRequested)
+            if (cancellation == null || cancellation.IsCancellationRequested)
             {
                 return;
             }
@@ -930,71 +1076,44 @@ public class HashViewModel : BaseViewModel
 
                 Action<int> updateProgress = size => this.Progress += size;
                 bool terminateByCancellation = false;
-                if (frozenAlgoModels.Length > 1 && Settings.Current.ParallelBetweenAlgos)
+                // 算法间并行只作用于"同一块数据"：每块用 Parallel.ForEach 算完并 join 后
+                // 才读下一块，天然保证块缓冲区（含预读器的双槽）不被提前复用。
+                // 不再用 Barrier 把 N 个线程长期挂在线程池上：那要求恰好 N 个并发副本，
+                // Parallel.ForEach 一旦凑不齐就会永久卡死，且只能靠抬高全局最小线程数兜底。
+                bool parallelBetweenAlgos = frozenAlgoModels.Length > 1
+                    && Settings.Current.ParallelBetweenAlgos;
+                while (true)
                 {
-                    int minThreads = frozenAlgoModels.Length;
-                    ThreadPool.GetMinThreads(out int minwt, out int mincpt);
-                    if (minwt < minThreads)
+                    stopwatch.Stop();
+                    this._manualPauseController.WaitOne();
+                    stopwatch.Start();
+                    if (cancellation.IsCancellationRequested)
                     {
-                        _ = ThreadPool.SetMinThreads(minThreads, mincpt);
+                        terminateByCancellation = true;
+                        break;
                     }
-                    using (Barrier barrier = new Barrier(minThreads, i =>
-                        {
-                            stopwatch.Stop();
-                            this._manualPauseController.WaitOne();
-                            stopwatch.Start();
-                            // 所有算法都已算完上一块，此时才能安全复用它的槽位读下一块
-                            if (ReadNextBlock())
-                            {
-                                Synchronization.UI.BeginInvoke(updateProgress, blockLength);
-                            }
-                        }))
+                    if (!ReadNextBlock())
                     {
-                        void DoTransformBlocks(AlgoInOutModel model)
-                        {
-                            while (true)
-                            {
-                                barrier.SignalAndWait();
-                                if (this.cancellation.IsCancellationRequested)
-                                {
-                                    barrier.RemoveParticipant();
-                                    terminateByCancellation = true;
-                                    break;
-                                }
-                                if (blockLength <= 0)
-                                {
-                                    break;
-                                }
-                                model.Algo.TransformBlock(blockBuffer, blockOffset, blockLength, null, 0);
-                            }
-                        }
-                        Parallel.ForEach(frozenAlgoModels, DoTransformBlocks);
+                        break;
                     }
-                }
-                else
-                {
-                    while (true)
+                    if (parallelBetweenAlgos)
                     {
-                        stopwatch.Stop();
-                        this._manualPauseController.WaitOne();
-                        stopwatch.Start();
-                        if (this.cancellation.IsCancellationRequested)
-                        {
-                            terminateByCancellation = true;
-                            break;
-                        }
-                        if (!ReadNextBlock())
-                        {
-                            break;
-                        }
+                        Parallel.ForEach(frozenAlgoModels, algoInOut =>
+                            algoInOut.Algo.TransformBlock(
+                                blockBuffer, blockOffset, blockLength, null, 0));
+                    }
+                    else
+                    {
                         foreach (AlgoInOutModel algoInOut in frozenAlgoModels)
                         {
-                            algoInOut.Algo.TransformBlock(blockBuffer, blockOffset, blockLength, null, 0);
+                            algoInOut.Algo.TransformBlock(
+                                blockBuffer, blockOffset, blockLength, null, 0);
                         }
-                        Synchronization.UI.BeginInvoke(updateProgress, blockLength);
                     }
+                    Synchronization.UI.BeginInvoke(updateProgress, blockLength);
                 }
-                if (!terminateByCancellation)
+                // 取消可能发生在循环退出后的这段窗口里，故再用令牌兜底一次，避免误标成功
+                if (!terminateByCancellation && !cancellation.IsCancellationRequested)
                 {
                     Action<AlgoInOutModel> updateHashBytes = i =>
                     {
@@ -1010,7 +1129,9 @@ public class HashViewModel : BaseViewModel
                     {
                         // 必须先设置 Succeeded，否则 ApplyHashCmpResult 一律设置 NoResult
                         this.Result = HashResult.Succeeded;
-                        this.ApplyHashCmpResult(this.Arguments.HashChecklist);
+                        // 优先沿用最后一次用于校验的清单，避免重算把清单的判定语义
+                        // 退化成手填值的 已匹配/不匹配 二元判定
+                        this.ApplyHashCmpResult(this.appliedChecklist ?? this.Arguments.HashChecklist);
                     });
                 }
             }
@@ -1058,7 +1179,7 @@ public class HashViewModel : BaseViewModel
     }
 
     public string GenerateTextInFormat(string format, OutputType output, bool all, bool endLine,
-        bool seeExport, bool casedName)
+        bool seeExport, bool casedName, bool escapeCsv = false)
     {
         if (this.Result == HashResult.Succeeded)
         {
@@ -1067,7 +1188,7 @@ public class HashViewModel : BaseViewModel
                 if (this.CurrentInOutModel != null)
                 {
                     return this.CurrentInOutModel.GenerateTextInFormat(this, format, output, endLine,
-                        seeExport, casedName);
+                        seeExport, casedName, escapeCsv);
                 }
             }
             else
@@ -1078,14 +1199,18 @@ public class HashViewModel : BaseViewModel
                     foreach (AlgoInOutModel inOutModel in this.AlgoInOutModels)
                     {
                         if (inOutModel.GenerateTextInFormat(
-                            this, format, output, endLine: true, seeExport, casedName) is string text)
+                            this, format, output, endLine: true, seeExport, casedName, escapeCsv) is string text)
                         {
                             stringBuilderForGenerateFormattedHash.Append(text);
                         }
                     }
                     if (!endLine && stringBuilderForGenerateFormattedHash.Length > 0)
                     {
-                        stringBuilderForGenerateFormattedHash.Remove(stringBuilderForGenerateFormattedHash.Length - 1, 1);
+                        // 末尾追加的是整个换行符，Windows 换行是 "\r\n"，只删 1 个字符会留下孤立 '\r'
+                        int breakLength = Math.Min(Settings.Current.UseUnixStyleLineBreaks ? 1 : 2,
+                            stringBuilderForGenerateFormattedHash.Length);
+                        stringBuilderForGenerateFormattedHash.Remove(
+                            stringBuilderForGenerateFormattedHash.Length - breakLength, breakLength);
                     }
                     return stringBuilderForGenerateFormattedHash.ToString();
                 }

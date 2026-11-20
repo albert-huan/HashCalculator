@@ -110,16 +110,10 @@
             <Output TaskParameter="Assemblies" ItemName="_AsmIdentity" />
         </GetAssemblyIdentity>
         <PropertyGroup>
-            <_LongVersion>@(_AsmIdentity->'%(Version)')</_LongVersion>
-            <!-- 取版本号前 3 段，第 4 段不为 0 时追加 -previewN -->
-            <_ShortVer>$(_LongVersion.Split('.')[0]).$(_LongVersion.Split('.')[1]).$(_LongVersion.Split('.')[2])</_ShortVer>
-            <_Revision>$(_LongVersion.Split('.')[3])</_Revision>
-        </PropertyGroup>
-        <PropertyGroup Condition="'$(_Revision)' == '0'">
-            <_FileNameVersionString>$(_ShortVer)</_FileNameVersionString>
-        </PropertyGroup>
-        <PropertyGroup Condition="'$(_Revision)' != '0'">
-            <_FileNameVersionString>$(_ShortVer)-preview$(_Revision)</_FileNameVersionString>
+            <!-- 发布文件名用三段版本号，如 HashCalculator-x64-7.0.1.exe；
+                 第四段修订号只留在程序集版本里 -->
+            <_AsmFullVersion>@(_AsmIdentity->'%(Version)')</_AsmFullVersion>
+            <_FileNameVersionString>$([System.Version]::Parse('$(_AsmFullVersion)').ToString(3))</_FileNameVersionString>
         </PropertyGroup>
         <Move SourceFiles="$(PublishDir)$(AssemblyName).exe" DestinationFiles="$(PublishDir)$(AssemblyName)-$(Platform)-$(_FileNameVersionString).exe" OverwriteReadOnlyFiles="true" />
     </Target>

@@ -253,7 +253,9 @@ public class AlgorithmsModel : BaseViewModel
 
     public static bool TryGetAlgoType(string name, out AlgoType algorithm)
     {
-        if (name == string.Empty)
+        // null 与空串都视为"没有算法名"，返回 UNKNOWN；不在此处挡住会让
+        // 下面的 name.Replace 抛 NullReferenceException，不符合本方法"解析失败返回 false"的契约
+        if (string.IsNullOrEmpty(name))
         {
             algorithm = AlgoType.UNKNOWN;
             return true;

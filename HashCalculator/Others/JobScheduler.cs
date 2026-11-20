@@ -59,6 +59,13 @@ public class JobScheduler : IDisposable
     private bool disposed = false;
 
     /// <summary>
+    /// 【全部取消】代际。Start/Resume 在锁外准备作业、锁内入队之间有一段窗口，
+    /// 期间发生的全部取消看不到这些作业；用代际变化识别并拒绝这批入队，
+    /// 避免"取消所有任务后最后总有一行没被取消掉"。
+    /// </summary>
+    private int cancellationGeneration = 0;
+
+    /// <summary>
     /// 调度循环退出标志，Dispose 时置位并唤醒阻塞在 Monitor.Wait 上的循环。
     /// </summary>
     private volatile bool stopped = false;
@@ -93,6 +100,14 @@ public class JobScheduler : IDisposable
     /// 保证每轮去抖都完整计数。
     /// </summary>
     private int pendingZeroTicks;
+
+    /// <summary>
+    /// "已开始"状态待补发标志（1 = 尚未成功送达界面）。
+    /// 提交可能发生在后台线程，此标志让失败的上报统一由界面线程的 Tick 重试，
+    /// 避免订阅者异常被丢进 Dispatcher 异步队列后既捕获不到、也无法重试。
+    /// 置位可来自任意线程，清除只在 Tick，故用 Interlocked 操作。
+    /// </summary>
+    private int startedReportPending = 0;
 
     /// <summary>
     /// 当前唯一的调度器实例。行内任务控制按钮的绑定目标是 HashViewModel，
@@ -141,29 +156,62 @@ public class JobScheduler : IDisposable
         GC.SuppressFinalize(this);
     }
 
+    /// <summary>
+    /// 发布界面事件并隔离订阅者异常：Tick 中抛出的异常会成为未处理的 Dispatcher
+    /// 异常，且界面订阅者失败不应中断调度器的去抖/停机逻辑。
+    /// 返回 false 表示未送达，调用方须保留状态以便下个 Tick 重试。
+    /// </summary>
+    private static bool TryRaise<T>(Action<T> handlers, T arg)
+    {
+        if (handlers == null)
+        {
+            return true;
+        }
+        try
+        {
+            handlers(arg);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
     private void StatusReportTick(object sender, EventArgs e)
     {
-        int pending = Volatile.Read(ref this.pendingTaskCount);
-        // 值未变化时不重复上报，空闲时不再无谓刷新 UI 界面
-        if (pending != this.reportedPendingCount)
+        // 补发上次未送达的"已开始"：先原子取出并清零，发布失败再置回，
+        // 补发期间新的置位不会被这次清零覆盖
+        if (Interlocked.CompareExchange(ref this.startedReportPending, 0, 1) == 1
+            && !TryRaise(this.JobStatusChanged, JobStatus.Started))
         {
-            this.reportedPendingCount = pending;
-            this.PendingCountChanged?.Invoke(pending);
+            Interlocked.Exchange(ref this.startedReportPending, 1);
         }
-        if (pending == 0)
+        int pending = Volatile.Read(ref this.pendingTaskCount);
+        bool countReported = pending == this.reportedPendingCount;
+        if (!countReported && TryRaise(this.PendingCountChanged, pending))
         {
-            // 连续多次确认为空后发布"已结束"，避免计算快于文件搜索时状态抖动
-            if (++this.pendingZeroTicks >= CONFIRM_TICKS)
-            {
-                // 同时停止定时器，故不会重复发布"已结束"，下次提交首个任务时再启动
-                this.pendingZeroTicks = 0;
-                this.statusReportTimer.Stop();
-                this.JobStatusChanged?.Invoke(JobStatus.Stopped);
-            }
+            // 只有界面确实收到才记入；失败则保留旧值，下个 Tick 自动重试，
+            // 杜绝"计数已记、界面没收到且此后再不重发"
+            this.reportedPendingCount = pending;
+            countReported = true;
+        }
+        // 队列非空、或最新计数尚未送达：重置去抖，不发布"已结束"
+        if (pending != 0 || !countReported)
+        {
+            this.pendingZeroTicks = 0;
             return;
         }
-        // 当 pending 不为零时重置确认计数，为下个周期的去抖初始化
-        this.pendingZeroTicks = 0;
+        if (++this.pendingZeroTicks >= CONFIRM_TICKS)
+        {
+            // 只有"已结束"送达后才停表；失败则保留去抖计数，下个 Tick 继续重试，
+            // 杜绝"定时器已停、界面还显示进行中"
+            if (TryRaise(this.JobStatusChanged, JobStatus.Stopped))
+            {
+                this.pendingZeroTicks = 0;
+                this.statusReportTimer.Stop();
+            }
+        }
     }
 
     /// <summary>
@@ -200,18 +248,43 @@ public class JobScheduler : IDisposable
 
     /// <summary>
     /// 把作业放入排队队列，并递增待计算计数。必须在持有 schedulerStateLock 时调用。
+    /// 返回值表示待计算计数是否由 0 变 1；"已开始"事件与定时器启动不得在此处执行，
+    /// 它们会回界面线程，必须在锁外交给 PublishStartedIfNeeded。
     /// </summary>
-    private void EnqueueHashViewModel(HashViewModel model)
+    private bool EnqueueHashViewModel(HashViewModel model)
     {
-        if (Interlocked.Increment(ref this.pendingTaskCount) == 1)
-        {
-            // 计数由 0 变 1，首个任务：发布"已开始"并启动定时器
-            this.JobStatusChanged?.Invoke(JobStatus.Started);
-            this.StartTimerOnUiThread();
-        }
+        bool isFirstTask = Interlocked.Increment(ref this.pendingTaskCount) == 1;
+        // 先完成入队再发布事件，订阅者异常不会造成"计数已加、作业未入队"的失衡
         model.SetStateAsync(HashState.Waiting);
         this.queuedJobs.AddLast(model);
         Monitor.PulseAll(this.schedulerStateLock);
+        return isFirstTask;
+    }
+
+    /// <summary>
+    /// 在 schedulerStateLock 之外上报"已开始"并启动上报定时器。
+    /// 界面线程上同步上报以保持点击即变；后台线程只置待补发标志，由 Tick 统一上报，
+    /// 避免订阅者异常被丢进 Dispatcher 异步队列后既捕获不到、也无法重试。
+    /// 两条路径的失败都会留下标志，由 Tick 持续补发。
+    /// </summary>
+    private void PublishStartedIfNeeded(bool started)
+    {
+        if (!started)
+        {
+            return;
+        }
+        if (Synchronization.UI.CheckAccess())
+        {
+            if (!TryRaise(this.JobStatusChanged, JobStatus.Started))
+            {
+                Interlocked.Exchange(ref this.startedReportPending, 1);
+            }
+        }
+        else
+        {
+            Interlocked.Exchange(ref this.startedReportPending, 1);
+        }
+        this.StartTimerOnUiThread();
     }
 
     /// <summary>
@@ -245,8 +318,10 @@ public class JobScheduler : IDisposable
         // 复制成数组固定本次操作范围，jobs 本身是数组时直接复用避免重复分配
         HashViewModel[] targets = jobs as HashViewModel[] ?? jobs.ToArray();
         List<HashViewModel> accepted = new List<HashViewModel>(targets.Length);
+        int generation;
         lock (this.schedulerStateLock)
         {
+            generation = this.cancellationGeneration;
             foreach (HashViewModel job in targets)
             {
                 if (job.CanStart(intent))
@@ -264,12 +339,36 @@ public class JobScheduler : IDisposable
         {
             return 0;
         }
+        List<HashViewModel> rejected = null;
+        bool started = false;
         lock (this.schedulerStateLock)
         {
-            foreach (HashViewModel job in accepted)
+            // 准备期间若发生过【全部取消】，这批作业既不在快照里也从未入队，
+            // 不能再放行，否则它们会绕过取消继续计算
+            if (generation != this.cancellationGeneration)
             {
-                this.EnqueueHashViewModel(job);
+                rejected = accepted;
             }
+            else
+            {
+                foreach (HashViewModel job in accepted)
+                {
+                    if (this.EnqueueHashViewModel(job))
+                    {
+                        started = true;
+                    }
+                }
+            }
+        }
+        // 事件发布与定时器启动必须在锁外
+        this.PublishStartedIfNeeded(started);
+        if (rejected != null)
+        {
+            foreach (HashViewModel job in rejected)
+            {
+                job.MarkCanceled();
+            }
+            return 0;
         }
         return accepted.Count;
     }
@@ -359,11 +458,15 @@ public class JobScheduler : IDisposable
             // 从未启动过的作业，"继续"等同于启动
             if (job.State == HashState.NoState)
             {
+                int generation = this.CurrentGeneration;
                 job.PrepareForRestartModel(ComputeIntent.FillMissing);
-                lock (this.schedulerStateLock)
+                if (!this.TryEnqueue(job, generation, out bool started))
                 {
-                    this.EnqueueHashViewModel(job);
+                    job.MarkCanceled();
+                    return;
                 }
+                this.PublishStartedIfNeeded(started);
+                this.ResumeQueuedTargets(new[] { job });
             }
             return;
         }
@@ -389,12 +492,11 @@ public class JobScheduler : IDisposable
         // 取目标集合的快照：调用方传入的可能是在不断变化的可变集合，
         // 复制成数组固定本次操作范围，jobs 本身是数组时直接复用避免重复分配
         HashViewModel[] targets = jobs as HashViewModel[] ?? jobs.ToArray();
-        // 用 running 锁内取"目标中已派发作业"的快照，供锁外使用：
-        // runningJobs 非线程安全，且锁外的分支处理会回界面线程（SetStateAsync），
-        // 不能持锁，故必须先在锁内把结果筛好
         HashSet<HashViewModel> running = new HashSet<HashViewModel>();
+        int generation;
         lock (this.schedulerStateLock)
         {
+            generation = this.cancellationGeneration;
             foreach (HashViewModel job in targets)
             {
                 if (this.runningJobs.Contains(job))
@@ -404,6 +506,7 @@ public class JobScheduler : IDisposable
                 }
             }
         }
+        List<HashViewModel> rejected = null;
         foreach (HashViewModel job in targets)
         {
             if (running.Contains(job))
@@ -413,11 +516,90 @@ public class JobScheduler : IDisposable
             else if (job.State == HashState.NoState)
             {
                 job.PrepareForRestartModel(ComputeIntent.FillMissing);
-                lock (this.schedulerStateLock)
+                if (!this.TryEnqueue(job, generation, out bool started))
                 {
-                    this.EnqueueHashViewModel(job);
+                    (rejected ??= new List<HashViewModel>()).Add(job);
+                }
+                else
+                {
+                    this.PublishStartedIfNeeded(started);
                 }
             }
+        }
+        if (rejected != null)
+        {
+            foreach (HashViewModel job in rejected)
+            {
+                job.MarkCanceled();
+            }
+        }
+        // 【全部暂停】时派发闸仍是关闭的，必须只派发本次被明确继续的排队作业
+        this.ResumeQueuedTargets(targets);
+    }
+
+    private int CurrentGeneration
+    {
+        get
+        {
+            lock (this.schedulerStateLock)
+            {
+                return this.cancellationGeneration;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 锁内复核取消代际后再入队；返回 false 表示期间发生过【全部取消】。
+    /// started 表示待计算计数是否由 0 变 1，由调用方在锁外发布"已开始"事件。
+    /// </summary>
+    private bool TryEnqueue(HashViewModel job, int generation, out bool started)
+    {
+        started = false;
+        lock (this.schedulerStateLock)
+        {
+            if (generation != this.cancellationGeneration)
+            {
+                return false;
+            }
+            started = this.EnqueueHashViewModel(job);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 【全部暂停】关闭了派发闸，此后「继续所选行」不能指望闸自己打开：
+    /// 只把本次明确继续的排队作业直接派发，其余排队作业继续等待。
+    /// </summary>
+    private void ResumeQueuedTargets(IEnumerable<HashViewModel> jobs)
+    {
+        List<HashViewModel> dispatched = new List<HashViewModel>();
+        lock (this.schedulerStateLock)
+        {
+            if (!this.dispatchPaused)
+            {
+                return;
+            }
+            foreach (HashViewModel job in jobs)
+            {
+                if (this.runningJobs.Count >= this.targetTaskCount)
+                {
+                    break;
+                }
+                LinkedListNode<HashViewModel> node = this.queuedJobs.Find(job);
+                if (node == null)
+                {
+                    continue;
+                }
+                this.queuedJobs.Remove(node);
+                job.SetPauseSignal(false);
+                this.runningJobs.Add(job);
+                dispatched.Add(job);
+            }
+        }
+        foreach (HashViewModel job in dispatched)
+        {
+            job.SetStateAsync(HashState.Running);
+            _ = this.RunModelAsync(job);
         }
     }
 
@@ -487,6 +669,9 @@ public class JobScheduler : IDisposable
         HashViewModel[] all = null;
         lock (this.schedulerStateLock)
         {
+            // 递增代际：让此刻正处于「锁外准备、锁内入队」窗口的启动/继续请求
+            // 在入队前发现自己已被取消
+            ++this.cancellationGeneration;
             all = this.queuedJobs.Concat(this.runningJobs).ToArray();
             // 排队的作业不会走到 RunModelAsync，其计数必须在此递减；
             // 在飞的作业由各自的 finally 递减，两处互斥，保证增减对称

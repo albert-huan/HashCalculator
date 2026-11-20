@@ -229,40 +229,56 @@ namespace HashCalculator
 
         public static Exception InstallShellExtension()
         {
-            Exception exception;
+            Exception exception = null;
             try
             {
                 if (!Directory.Exists(Settings.ConfigInfo.ShellExtensionDir))
                 {
                     Directory.CreateDirectory(Settings.ConfigInfo.ShellExtensionDir);
                 }
-                if (UninstallShellExtension() is Exception exception1)
+                string shellExtFile = Settings.ConfigInfo.ShellExtensionFile;
+                // 便携模式下配置目录就是程序目录，而 64 位扩展模块与主程序集同名
+                // （都是 HashCalculator.dll），正在运行的主程序集占用该文件，无法写入。
+                // 改用带 ShellExt 后缀的文件名，注册表记录的路径随之更新。
+                string mainAssemblyFile = Path.Combine(AppContext.BaseDirectory, $"{Info.Name}.dll");
+                if (string.Equals(shellExtFile, mainAssemblyFile,
+                    StringComparison.OrdinalIgnoreCase))
                 {
-                    exception = exception1;
+                    shellExtFile = Path.Combine(Path.GetDirectoryName(shellExtFile),
+                        Path.GetFileNameWithoutExtension(shellExtFile) + "ShellExt.dll");
+                }
+                Exception exception1 = UninstallShellExtension();
+                if (exception1 != null)
+                {
+                    exception = JoinExceptionMessagesAndGenerateNew(exception, exception1);
                 }
                 if (Info.ExecutingA.GetManifestResourceStream(embeddedShellExtPath) is Stream manifest)
                 {
                     using (manifest)
                     {
-                        manifest.ToNewFile(Settings.ConfigInfo.ShellExtensionFile);
+                        manifest.ToNewFile(shellExtFile);
                     }
                 }
                 else
                 {
-                    exception = new MissingManifestResourceException("内嵌的右键菜单扩展模块资源丢失");
+                    exception = JoinExceptionMessagesAndGenerateNew(exception,
+                        new MissingManifestResourceException("内嵌的右键菜单扩展模块资源丢失"));
                 }
-                if (RegisterShellExtDll(Settings.ConfigInfo.ShellExtensionFile) is Exception exception2)
+                Exception exception2 = RegisterShellExtDll(shellExtFile);
+                if (exception2 != null)
                 {
-                    exception = exception2;
+                    exception = JoinExceptionMessagesAndGenerateNew(exception, exception2);
                 }
                 SHELL32.SHChangeNotify(HChangeNotifyEventID.SHCNE_ASSOCCHANGED, HChangeNotifyFlags.SHCNF_IDLIST,
                     IntPtr.Zero, IntPtr.Zero);
-                Settings.UpdateShellMenuConfigFilePath(Settings.ConfigInfo.ShellExtensionFile);
-                exception = RegUpdateAppPath();
+                Settings.UpdateShellMenuConfigFilePath(shellExtFile);
+                // 不能让最后一步覆盖前面步骤的失败，否则真实原因被吞掉、
+                // 甚至 regsvr32 注册失败却提示安装成功
+                exception = JoinExceptionMessagesAndGenerateNew(exception, RegUpdateAppPath());
             }
             catch (Exception exception3)
             {
-                exception = exception3;
+                exception = JoinExceptionMessagesAndGenerateNew(exception, exception3);
             }
             Settings.UpdateDisplayingInformation();
             return exception;

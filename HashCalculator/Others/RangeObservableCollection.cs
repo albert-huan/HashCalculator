@@ -98,16 +98,10 @@ public class RangeObservableCollection<T> : ObservableCollection<T>
     {
         ArgumentNullException.ThrowIfNull(items);
         this.Items.Clear();
-        if (items is List<T> values)
+        // 原实现把 items 追加到它自己（values.AddRange(items)），清空后集合永远为空
+        foreach (T item in items)
         {
-            values.AddRange(items);
-        }
-        else
-        {
-            foreach (T item in items)
-            {
-                this.Items.Add(item);
-            }
+            this.Items.Add(item);
         }
         this.OnCollectionChanged(new NotifyCollectionChangedEventArgs(
             NotifyCollectionChangedAction.Reset));

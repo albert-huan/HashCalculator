@@ -79,10 +79,16 @@ namespace HashCalculator
                         {
                             Owner = MainWindow.Current,
                         };
-                        foreach (HashViewModel model in targets)
+                        // ShutdownModelWait 会等待计算线程释放独占锁，而计算线程持锁期间
+                        // 会同步回 UI 线程更新状态；在后台线程等待，避免 UI 线程被锁阻塞
+                        // 导致两边互等的死锁
+                        await Task.Run(() =>
                         {
-                            model.ShutdownModelWait();
-                        }
+                            foreach (HashViewModel model in targets)
+                            {
+                                model.ShutdownModelWait();
+                            }
+                        });
                         hashViewModels.RemoveItems(targets);
                         Task<string> deleteFilesTask = Task.Run(() =>
                         {

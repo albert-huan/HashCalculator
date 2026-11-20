@@ -82,6 +82,19 @@ internal static class USER32
     internal static extern IntPtr SetClipboardData(CF uFormat, IntPtr hMem);
 
     /// <summary>
+    /// 注册格式（如 HTML Format）没有对应的 CF 枚举常量，需按 uint 传入。
+    /// </summary>
+    [DllImport("user32.dll", EntryPoint = "SetClipboardData")]
+    internal static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    /// <summary>
+    /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclipboardformatw
+    /// </summary>
+    [DllImport("user32.dll", EntryPoint = "RegisterClipboardFormatW",
+        CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    internal static extern uint RegisterClipboardFormatW(string lpszFormat);
+
+    /// <summary>
     /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos
     /// </summary>
     [DllImport("user32.dll")]

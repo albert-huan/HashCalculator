@@ -7,11 +7,13 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using HashCalculator.ViewModels.Pages;
 using HashCalculator.Views.Windows;
 using Drawing = System.Drawing;
 
@@ -257,24 +259,69 @@ internal static class CommonUtils
         return default(byte[]);
     }
 
+    private static HashSet<int> supportedDigestLengths = null;
+
+    /// <summary>
+    /// 字节数是否对应某个受支持算法的摘要长度。<br/>
+    /// 用于甄别"看起来像哈希、其实不是"的字符串：恰好是合法 Base64 的普通文件名
+    /// （如 "file"）会被解成 3 字节，不应被当成校验信息里的哈希值。
+    /// </summary>
+    public static bool IsSupportedDigestLength(int length)
+    {
+        HashSet<int> lengths = supportedDigestLengths ??= new HashSet<int>(
+            AlgorithmsModel.ProvidedAlgos.Select(i => i.IAlgo.DigestLength));
+        return lengths.Contains(length);
+    }
+
     public static byte[] HashBytesFromString(string hashString)
     {
-        if (!string.IsNullOrEmpty(hashString))
+        if (string.IsNullOrEmpty(hashString))
         {
-            hashString = hashString.Trim(' ', '\r', '\n');
-            if (!hashString.Contains(' '))
+            return default(byte[]);
+        }
+        hashString = hashString.Trim(' ', '\r', '\n');
+        if (hashString.Contains(' '))
+        {
+            return default(byte[]);
+        }
+        // 全由 hex 字符组成且长度为偶数的 Base64 串两种解码都会成功。
+        // 优先选取解出"受支持摘要长度"的那一种，避免把 Base64 哈希误判成 hex。
+        byte[] fromHex = FromHexString(hashString);
+        if (fromHex != null && IsSupportedDigestLength(fromHex.Length))
+        {
+            return fromHex;
+        }
+        byte[] fromBase64 = FromBase64String(hashString);
+        if (fromBase64 != null && IsSupportedDigestLength(fromBase64.Length))
+        {
+            return fromBase64;
+        }
+        // 都不像摘要时保留原有优先级，由调用方按长度再决定是否接受
+        return fromHex ?? fromBase64;
+    }
+
+    /// <summary>
+    /// 已知实际摘要长度时消解 hex / Base64 歧义：优先取能解出该长度的那种编码。<br/>
+    /// 例如 SHA384 的 Base64 结果恰好是 64 个纯 hex 字符且没有 padding，
+    /// 无上下文时会被当成 32 字节的 hex 摘要；比对时结果长度已知，可以正确还原。
+    /// </summary>
+    public static byte[] HashBytesFromString(string hashString, int expectedLength)
+    {
+        if (!string.IsNullOrEmpty(hashString) && expectedLength > 0)
+        {
+            string trimmed = hashString.Trim(' ', '\r', '\n');
+            byte[] fromBase64 = FromBase64String(trimmed);
+            if (fromBase64 != null && fromBase64.Length == expectedLength)
             {
-                if (FromHexString(hashString) is byte[] bytesGuessFromHex)
-                {
-                    return bytesGuessFromHex;
-                }
-                else if (FromBase64String(hashString) is byte[] bytesGuessFromBase64)
-                {
-                    return bytesGuessFromBase64;
-                }
+                return fromBase64;
+            }
+            byte[] fromHex = FromHexString(trimmed);
+            if (fromHex != null && fromHex.Length == expectedLength)
+            {
+                return fromHex;
             }
         }
-        return default(byte[]);
+        return HashBytesFromString(hashString);
     }
 
     public static bool SendToRecycleBin(IntPtr hParent, string path, bool silent = true)
@@ -491,27 +538,41 @@ internal static class CommonUtils
                 IntPtr hMem = IntPtr.Zero;
                 try
                 {
-                    hMem = Marshal.StringToHGlobalUni(text);
-                }
-                catch (Exception e)
-                {
-                    reasonForFailure = $"错误详情：{e.Message}";
-                }
-                if (reasonForFailure == null)
-                {
-                    reasonForFailure = hMem != IntPtr.Zero && USER32.EmptyClipboard() ?
-                        null : "无法为内容分配内存或无法取得剪贴板所有权。";
+                    try
+                    {
+                        hMem = Marshal.StringToHGlobalUni(text);
+                    }
+                    catch (Exception e)
+                    {
+                        reasonForFailure = $"错误详情：{e.Message}";
+                    }
                     if (reasonForFailure == null)
                     {
-                        reasonForFailure = USER32.SetClipboardData(CF.CF_UNICODETEXT, hMem) == hMem ?
-                            null : "无法将内容更新到剪贴板上。";
+                        reasonForFailure = hMem != IntPtr.Zero && USER32.EmptyClipboard() ?
+                            null : "无法为内容分配内存或无法取得剪贴板所有权。";
                         if (reasonForFailure == null)
                         {
-                            Settings.Current.ClipboardUpdatedByMe = true;
+                            // EmptyClipboard 本身就会触发通知，失败路径也要抑制自动校验
+                            MarkClipboardUpdateAsSelf();
+                            reasonForFailure = USER32.SetClipboardData(CF.CF_UNICODETEXT, hMem) == hMem ?
+                                null : "无法将内容更新到剪贴板上。";
+                            if (reasonForFailure == null)
+                            {
+                                // 成功后内存所有权归系统，不能再由本程序释放
+                                hMem = IntPtr.Zero;
+                            }
                         }
                     }
                 }
-                USER32.CloseClipboard();
+                finally
+                {
+                    USER32.CloseClipboard();
+                    // 任何失败分支下系统都不会接管这块内存，必须自行释放
+                    if (hMem != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(hMem);
+                    }
+                }
             }
         }
         if (!string.IsNullOrEmpty(reasonForFailure))
@@ -519,6 +580,117 @@ internal static class CommonUtils
             NotificationSender.ShowMessageBox(owner, "复制失败", reasonForFailure);
         }
         return reasonForFailure == null;
+    }
+
+    /// <summary>
+    /// 把同一份表格同时以 Unicode 文本（TSV）和 HTML 表格写入剪贴板：Word 等富文本编辑器
+    /// 优先取 HTML 格式，直接得到可编辑的表格；记事本、微信等只认文本的程序取 TSV。<br/>
+    /// 两种格式必须在一次 OpenClipboard 会话内写入；HTML 写入失败不算整体失败，
+    /// 纯文本仍在剪贴板上，richTableCopied 返回 false 供调用方提示降级。
+    /// </summary>
+    public static bool ClipboardSetTable(string text, string html, out bool richTableCopied)
+    {
+        richTableCopied = false;
+        string reasonForFailure = string.IsNullOrEmpty(text) ? "要复制的内容为空。" : null;
+        if (reasonForFailure == null)
+        {
+            reasonForFailure = USER32.OpenClipboard(MainWindow.WndHandle) ?
+                null : "打开剪贴板失败，剪贴板可能正被其他程序占用。";
+            if (reasonForFailure == null)
+            {
+                IntPtr hText = IntPtr.Zero;
+                IntPtr hHtml = IntPtr.Zero;
+                try
+                {
+                    try
+                    {
+                        hText = Marshal.StringToHGlobalUni(text);
+                    }
+                    catch (Exception e)
+                    {
+                        reasonForFailure = $"错误详情：{e.Message}";
+                    }
+                    if (reasonForFailure == null)
+                    {
+                        reasonForFailure = hText != IntPtr.Zero && USER32.EmptyClipboard() ?
+                            null : "无法为内容分配内存或无法取得剪贴板所有权。";
+                        if (reasonForFailure == null)
+                        {
+                            // EmptyClipboard 与每次 SetClipboardData 都会触发 WM_CLIPBOARDUPDATE，
+                            // 必须在写入前登记忽略窗口，避免本程序把自己的表格当成校验清单
+                            MarkClipboardUpdateAsSelf();
+                            reasonForFailure = USER32.SetClipboardData(CF.CF_UNICODETEXT, hText) == hText ?
+                                null : "无法将内容更新到剪贴板上。";
+                            if (reasonForFailure == null)
+                            {
+                                // 成功后内存所有权归系统，不能再由本程序释放
+                                hText = IntPtr.Zero;
+                                richTableCopied = TrySetHtmlFormat(html, ref hHtml);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    USER32.CloseClipboard();
+                    if (hText != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(hText);
+                    }
+                    if (hHtml != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(hHtml);
+                    }
+                }
+            }
+        }
+        if (!string.IsNullOrEmpty(reasonForFailure))
+        {
+            NotificationSender.ShowMessageBox(null, "复制失败", reasonForFailure);
+        }
+        return reasonForFailure == null;
+    }
+
+    private static bool TrySetHtmlFormat(string html, ref IntPtr hHtml)
+    {
+        if (string.IsNullOrEmpty(html))
+        {
+            return false;
+        }
+        try
+        {
+            uint format = USER32.RegisterClipboardFormatW("HTML Format");
+            if (format == 0)
+            {
+                return false;
+            }
+            // CF_HTML 规定内容是 UTF-8 字节流并以 NUL 结尾，头部偏移也按字节计算
+            byte[] bytes = Encoding.UTF8.GetBytes(html + "\0");
+            hHtml = Marshal.AllocHGlobal(bytes.Length);
+            Marshal.Copy(bytes, 0, hHtml, bytes.Length);
+            if (USER32.SetClipboardData(format, hHtml) != hHtml)
+            {
+                return false;
+            }
+            // 成功后内存所有权归系统，不能再由本程序释放
+            hHtml = IntPtr.Zero;
+            return true;
+        }
+        catch (Exception)
+        {
+            // HTML 格式只是增强，失败时保留已写入的纯文本
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 登记"本程序正在写剪贴板"：一次写入可能产生多条 WM_CLIPBOARDUPDATE
+    /// （EmptyClipboard 一条、每个格式各一条），用时间窗覆盖整次写入，
+    /// 避免把复制出去的表格当成外部校验清单解析。
+    /// </summary>
+    private static void MarkClipboardUpdateAsSelf()
+    {
+        Settings.Current.IgnoreClipboardUpdateUntil = DateTime.Now.AddMilliseconds(500);
     }
 
     public static bool ClipboardGetText(out string text)
@@ -645,14 +817,21 @@ internal static class CommonUtils
 
     public static double GetScreenScalingFactor()
     {
-        Drawing.Graphics graphics = Drawing.Graphics.FromHwnd(IntPtr.Zero);
+        // Graphics 与 HDC 都是非托管资源：前者由 using 释放，后者在 finally 中归还，
+        // 否则每次调用都会遗留 GDI+ 句柄直到终结器回收
+        using Drawing.Graphics graphics = Drawing.Graphics.FromHwnd(IntPtr.Zero);
         IntPtr desktop = graphics.GetHdc();
-        // 以像素为单位的实际横向分辨率
-        int actualScreenWidth = GDI32.GetDeviceCaps(desktop, (int)DeviceCap.HORZRES);
-        graphics.ReleaseHdc(desktop);
-        // 缩放率变大 SystemParameters.PrimaryScreenWidth 变小（几个像素并成一个了），反之同理
-        double screenScalingFactor = actualScreenWidth / SystemParameters.PrimaryScreenWidth;
-        return screenScalingFactor;
+        try
+        {
+            // 以像素为单位的实际横向分辨率
+            int actualScreenWidth = GDI32.GetDeviceCaps(desktop, (int)DeviceCap.HORZRES);
+            // 缩放率变大 SystemParameters.PrimaryScreenWidth 变小（几个像素并成一个了），反之同理
+            return actualScreenWidth / SystemParameters.PrimaryScreenWidth;
+        }
+        finally
+        {
+            graphics.ReleaseHdc(desktop);
+        }
     }
 
     public static BitmapSource GetFileIcon(string filePath, bool largeIcon = false)

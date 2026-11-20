@@ -364,3 +364,4 @@ MigrationBackup/
 /.vscode
 /.codebuddy/
 /HashCalculator/LibraryFiles/
+Build/

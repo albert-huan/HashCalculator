@@ -423,20 +423,49 @@ internal static class CommonExts
     public static void ReorderGridColumns(this ObservableCollection<DataGridColumn> columns,
         Dictionary<string, ColumnProperty> order)
     {
-        if (columns != null && order != null)
+        if (columns == null || order == null)
+        {
+            return;
+        }
+        // 从旧版本升级时，新增的列（如【校验值】）在保存的列顺序里没有记录。
+        // 先记下它们在 XAML 中的默认位置，恢复完旧列后再放回，避免被挤到表格末尾。
+        List<KeyValuePair<DataGridColumn, int>> newColumns =
+            new List<KeyValuePair<DataGridColumn, int>>();
+        foreach (DataGridColumn column in columns)
+        {
+            if (column.Header is string header && !order.ContainsKey(header))
+            {
+                newColumns.Add(new KeyValuePair<DataGridColumn, int>(column, column.DisplayIndex));
+            }
+        }
+        // 按保存的 DisplayIndex 升序写回：WPF 设置 DisplayIndex 会挪动其它列，
+        // 按列定义顺序乱序写回会让先恢复的列被后恢复的列挤走
+        List<KeyValuePair<string, ColumnProperty>> saved =
+            new List<KeyValuePair<string, ColumnProperty>>(order);
+        saved.Sort((a, b) => a.Value.Index.CompareTo(b.Value.Index));
+        foreach (KeyValuePair<string, ColumnProperty> pair in saved)
         {
             foreach (DataGridColumn column in columns)
             {
-                if (column.Header is string header && order.TryGetValue(header, out ColumnProperty property))
+                if (column.Header is string header && header == pair.Key)
                 {
-                    if (property.Index >= 0 &&
-                        property.Index < columns.Count &&
-                        column.DisplayIndex != property.Index)
+                    if (pair.Value.Index >= 0 && pair.Value.Index < columns.Count &&
+                        column.DisplayIndex != pair.Value.Index)
                     {
-                        column.DisplayIndex = property.Index;
+                        column.DisplayIndex = pair.Value.Index;
                     }
-                    column.Width = property.Width;
+                    column.Width = pair.Value.Width;
+                    break;
                 }
+            }
+        }
+        newColumns.Sort((a, b) => a.Value.CompareTo(b.Value));
+        foreach (KeyValuePair<DataGridColumn, int> pair in newColumns)
+        {
+            int target = pair.Value < columns.Count ? pair.Value : columns.Count - 1;
+            if (target >= 0 && pair.Key.DisplayIndex != target)
+            {
+                pair.Key.DisplayIndex = target;
             }
         }
     }

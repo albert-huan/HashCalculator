@@ -241,13 +241,14 @@ public partial class MainWindow
     {
         if (msg == WM.WM_CLIPBOARDUPDATE)
         {
-            if (!Settings.Current.ClipboardUpdatedByMe &&
-                DateTime.Now - this.lastClipboardUpdateDateTime > clipboardTriggerMinInterval)
+            DateTime now = DateTime.Now;
+            // 本程序一次写入会连续产生多条通知，忽略窗口内一律不再当作外部校验清单
+            if (now >= Settings.Current.IgnoreClipboardUpdateUntil &&
+                now - this.lastClipboardUpdateDateTime > clipboardTriggerMinInterval)
             {
                 this._homePageViewModel.CheckHashUseClipboardText();
             }
-            Settings.Current.ClipboardUpdatedByMe = false;
-            this.lastClipboardUpdateDateTime = DateTime.Now;
+            this.lastClipboardUpdateDateTime = now;
         }
         return IntPtr.Zero;
     }

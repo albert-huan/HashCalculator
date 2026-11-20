@@ -45,6 +45,18 @@ public partial class HomePage : Page, INavigableView<HomeViewModel>
         }
     }
 
+    private void MainDataGridContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (sender is DataGrid dataGrid)
+        {
+            // 子菜单的 CommandParameter 依赖 RelativeSource 跨层查找，可能拿不到
+            // PlacementTarget.SelectedItems；菜单打开时直接从 DataGrid 取快照作为可靠来源
+            this.ViewModel.SelectedModelsForTable = dataGrid.SelectedItems
+                .OfType<HashViewModel>()
+                .ToArray();
+        }
+    }
+
     private void DataGridHashingFilesPrevKeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.Escape && sender is DataGrid dataGrid)

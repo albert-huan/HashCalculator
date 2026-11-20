@@ -21,7 +21,8 @@ public class TemplateForChecklistModel
         {
             Name = "CSV文件",
             Extension = ".csv",
-            Template = "^$algo$,$hash$,$name$\\r?$"
+            // 兼容导出时对字段加的引号（字段名含逗号/双引号的情况）
+            Template = "^\"?$algo$\"?,\"?$hash$\"?,\"?$name$\"?\\r?$"
         };
 
     public static readonly TemplateForChecklistModel HcbFile =

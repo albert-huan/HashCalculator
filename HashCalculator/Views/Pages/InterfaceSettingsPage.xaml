@@ -117,6 +117,16 @@
                             OffContent="显示"
                             OnContent="隐藏" />
                     </wpfui:CardControl>
+                    <wpfui:CardControl>
+                        <wpfui:CardControl.Header>
+                            <wpfui:TextBlock Text="校验值列" />
+                        </wpfui:CardControl.Header>
+                        <wpfui:ToggleSwitch
+                            IsChecked="{Binding NoExpectedHashColumn, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                            LabelPosition="Left"
+                            OffContent="显示"
+                            OnContent="隐藏" />
+                    </wpfui:CardControl>
                 </StackPanel>
             </wpfui:CardExpander>
             <controls:MinLimitedCardControl Margin="0,4,0,0">

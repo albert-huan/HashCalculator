@@ -100,12 +100,12 @@
             <controls:MinLimitedCardControl Margin="0,4,0,0">
                 <controls:MinLimitedCardControl.Header>
                     <StackPanel>
-                        <wpfui:TextBlock Text="有新复制的校验信息时自动启动校验" />
+                        <wpfui:TextBlock Text="有新复制的校验信息时自动启动校验（默认关闭）" />
                         <wpfui:TextBlock
                             Margin="0,2,0,0"
                             FontTypography="Caption"
                             Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                            Text="当计算完成后，剪贴板有新复制的校验信息时自动填充校验信息文本框并启动校验。"
+                            Text="默认关闭。开启后剪贴板出现新的校验信息时自动对当前列表执行校验，复制其它内容也可能被误判为校验信息。"
                             TextWrapping="WrapWithOverflow" />
                     </StackPanel>
                 </controls:MinLimitedCardControl.Header>

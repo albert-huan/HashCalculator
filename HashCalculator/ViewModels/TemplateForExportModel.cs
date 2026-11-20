@@ -21,6 +21,9 @@ namespace HashCalculator
                 "$algo$,$hash$,$relpath$")
             {
                 UsingEncoding = EncodingEnum.ANSI,
+                // 引号与转义由生成时按字段值添加，模板本身保持不含引号，
+                // 这样文件名里含逗号、双引号时也不会把列打乱
+                EscapeCsvValues = true,
             };
 
         public static readonly TemplateForExportModel HcbModel =
@@ -40,6 +43,27 @@ namespace HashCalculator
                 "文本文件",
                 ".txt",
                 "#$algo$ *$hash$ *$relpath$");
+
+        /// <summary>
+        /// 每行按【文件名&lt;制表符&gt;哈希值】导出，即 hashsums.txt 风格的校验清单。<br/>
+        /// 该格式可被校验信息解析方案「通用三」($name$ 空白 $hash$) 原样读回再校验。
+        /// </summary>
+        public static readonly TemplateForExportModel NameHashTabModel =
+            new TemplateForExportModel(
+                "文件名+制表符+哈希值",
+                ".txt",
+                "$name$$horztab$$hash$");
+
+        /// <summary>
+        /// 每行按【文件名&lt;TAB&gt;算法&lt;TAB&gt;校验值&lt;TAB&gt;校验结果】导出。<br/>
+        /// 校验结果以「一致 / 不一致」显示，其余状态为 不确定 / 无关联 / 未校验，
+        /// 便于把校验结论连同用户填写（或清单回填）的期望值一起归档。
+        /// </summary>
+        public static readonly TemplateForExportModel ExpectedAndCmpModel =
+            new TemplateForExportModel(
+                "校验值与校验结果",
+                ".txt",
+                "$name$$horztab$$algo$$horztab$$expected$$horztab$$cmp$");
 
         public TemplateForExportModel() { }
 
@@ -69,6 +93,12 @@ namespace HashCalculator
 
         public EncodingEnum UsingEncoding { get; set; }
 
+        /// <summary>
+        /// 生成时把各字段按 CSV 规则加引号并转义：支持含逗号/双引号的文件名，
+        /// 并给 = + - @ 开头的字段加前缀，防止表格软件把内容当公式执行。
+        /// </summary>
+        public bool EscapeCsvValues { get; set; }
+
         public string GetFilterFormat(bool noExt)
         {
             if (this.IsValidProps())
@@ -96,14 +126,16 @@ namespace HashCalculator
             {
                 return new TemplateForExportModel(this.Name, this.Extension, this.Template)
                 {
-                    UsingEncoding = this.UsingEncoding
+                    UsingEncoding = this.UsingEncoding,
+                    EscapeCsvValues = this.EscapeCsvValues
                 };
             }
             else
             {
                 return new TemplateForExportModel(this.Name + nameSuffix, this.Extension, this.Template)
                 {
-                    UsingEncoding = this.UsingEncoding
+                    UsingEncoding = this.UsingEncoding,
+                    EscapeCsvValues = this.EscapeCsvValues
                 };
             }
         }

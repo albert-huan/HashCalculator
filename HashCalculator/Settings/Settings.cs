@@ -237,6 +237,13 @@ internal static class Settings
                 MessageBoxButton.OK, MessageBoxImage.Error,
                 MessageBoxResult.OK, MessageBoxOptions.ServiceNotification);
         }
+        // 一次性迁移：旧版本默认开启剪贴板自动校验，复制普通内容也可能被当成
+        // 校验清单并给列表写出结论。首次加载后强制关闭，之后用户主动开启的状态不再被重置。
+        if (!Current.ClipboardAutoCheckDefaultMigrated)
+        {
+            Current.MonitorNewHashStringInClipboard = false;
+            Current.ClipboardAutoCheckDefaultMigrated = true;
+        }
         UpdateDisplayingInformation();
         if (!settingsViewModelLoaded)
         {

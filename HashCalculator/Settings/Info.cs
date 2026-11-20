@@ -16,7 +16,8 @@ namespace HashCalculator
         public static readonly AssemblyName ExecutingName = ExecutingA.GetName();
         public static readonly string Name = ExecutingName.Name;
         public static readonly Version V = ExecutingName.Version;
-        public static readonly string Ver = $"{V.Major}.{V.Minor}.{V.Build}{(V.Revision > 0 ? $"-preview{V.Revision}" : "")}";
+        // 界面与发布文件名都使用三段版本号（如 7.0.1），第四段仅保留在程序集版本里
+        public static readonly string Ver = $"{V.Major}.{V.Minor}.{V.Build}";
 
         public const string Title = "哈希值计算器";
         public const string Author = "hrpzcf";

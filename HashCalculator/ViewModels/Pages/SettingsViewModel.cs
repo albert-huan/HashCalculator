@@ -50,6 +50,7 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
     private bool noDurationColumn = false;
     private bool noExportColumn = false;
     private bool noCmpResultColumn = false;
+    private bool noExpectedHashColumn = false;
     private bool isMainRowSelectedByCheckBox = false;
     private bool showHashInTagColumn = false;
     private bool generateTextInFormat = false;
@@ -62,7 +63,7 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
     private bool displayMainWndButtonText = true;
     private bool useDefaultOutputTypeWhenExporting = true;
     private bool useExistingClipboardTextForCheck = false;
-    private bool monitorNewHashStringInClipboard = true;
+    private bool monitorNewHashStringInClipboard = false;
     private bool switchMainWndFgWhenNewHashCopied = true;
     private bool caseOfCopiedAlgNameFollowsOutputType = false;
     private bool exportInMainControlsChildExportsInRow = false;
@@ -485,6 +486,12 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
         set => this.SetPropNotify(ref this.noCmpResultColumn, value);
     }
 
+    public bool NoExpectedHashColumn
+    {
+        get => this.noExpectedHashColumn;
+        set => this.SetPropNotify(ref this.noExpectedHashColumn, value);
+    }
+
     public bool NoFullPathColumn
     {
         get => this.noFullPathColumn;
@@ -728,6 +735,12 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
         get => this.monitorNewHashStringInClipboard;
         set => this.SetPropNotify(ref this.monitorNewHashStringInClipboard, value);
     }
+
+    /// <summary>
+    /// 一次性迁移标记：旧配置默认开启剪贴板自动校验，加载后强制关闭一次；
+    /// 持久化后用户主动开启的监听不会被后续启动重置。
+    /// </summary>
+    public bool ClipboardAutoCheckDefaultMigrated { get; set; }
 
     public bool SwitchMainWndFgWhenNewHashCopied
     {
@@ -1391,7 +1404,9 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
             TemplateForExportModel.CsvModel.Copy(null),
             TemplateForExportModel.HcbModel.Copy(null),
             TemplateForExportModel.SfvModel.Copy(null),
-            TemplateForExportModel.AllModel.Copy(null)
+            TemplateForExportModel.AllModel.Copy(null),
+            TemplateForExportModel.NameHashTabModel.Copy(null),
+            TemplateForExportModel.ExpectedAndCmpModel.Copy(null)
         };
     }
 
@@ -1755,9 +1770,52 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
         {
             this.ResetTemplatesForExport();
         }
+        else
+        {
+            // 老配置里已保存过方案列表，不会走上面的重置，需补入新增的默认方案。
+            // 按模板内容判重：用户已自建同格式方案时不再重复添加。
+            if (!this.TemplatesForExport.Any(i => i != null &&
+                i.Template == TemplateForExportModel.NameHashTabModel.Template))
+            {
+                this.TemplatesForExport.Add(TemplateForExportModel.NameHashTabModel.Copy(null));
+            }
+            if (!this.TemplatesForExport.Any(i => i != null &&
+                i.Template == TemplateForExportModel.ExpectedAndCmpModel.Template))
+            {
+                this.TemplatesForExport.Add(TemplateForExportModel.ExpectedAndCmpModel.Copy(null));
+            }
+        }
         if (this.TemplatesForChecklist == null || !this.TemplatesForChecklist.Any())
         {
             this.ResetTemplatesForChecklist();
+        }
+        // 老配置里若删改过「通用三」，新增的 文件名<TAB>哈希值 导出方案将无人能读回；
+        // 按模板内容判重补齐，用户自建同格式方案时不重复添加
+        else if (!this.TemplatesForChecklist.Any(i => i != null &&
+            i.Template == TemplateForChecklistModel.AnyFile3.Template))
+        {
+            this.TemplatesForChecklist.Add(TemplateForChecklistModel.AnyFile3.Copy(null));
+        }
+        // 把老配置里不认识带引号字段的 CSV 导出/解析方案升级到新格式。
+        // 只按已知旧模板精确匹配，用户自定义过的模板保持原样。
+        foreach (TemplateForExportModel export in this.TemplatesForExport)
+        {
+            if (export != null && export.Extension == ".csv" &&
+                (export.Template == "$algo$,$hash$,$relpath$" ||
+                 export.Template == "$algo$,$hash$,$name$" ||
+                 export.Template == "\"$algo$\",\"$hash$\",\"$relpath$\""))
+            {
+                export.Template = TemplateForExportModel.CsvModel.Template;
+                export.EscapeCsvValues = true;
+            }
+        }
+        foreach (TemplateForChecklistModel parser in this.TemplatesForChecklist)
+        {
+            if (parser != null && parser.Extension == ".csv" &&
+                parser.Template == "^$algo$,$hash$,$name$\\r?$")
+            {
+                parser.Template = TemplateForChecklistModel.CsvFile.Template;
+            }
         }
         if (this.AlgorithmAliasList != null)
         {
@@ -1828,8 +1886,13 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
         }
     }
 
+    /// <summary>
+    /// 本程序写入剪贴板后，在此时间之前的 WM_CLIPBOARDUPDATE 一律视为自己触发的，
+    /// 不启动自动校验。取代原先的单次布尔标志：一次多格式写入会产生多条通知，
+    /// 布尔标志只能挡住第一条，且通知丢失时会残留并吞掉下一次外部复制。
+    /// </summary>
     [JsonIgnore, XmlIgnore]
-    public bool ClipboardUpdatedByMe { get; set; }
+    public DateTime IgnoreClipboardUpdateUntil { get; set; }
 
     [JsonIgnore, XmlIgnore]
     public static GenericItemModel[] AvailableOutputTypes { get; } =
@@ -2055,6 +2118,9 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
         new GenericItemModel("$name$", "在复制时此占位符将被替换为实际文件名。"),
         new GenericItemModel("$newline$", "在复制时此占位符将被替换为 Windows 换行符。"),
         new GenericItemModel("$horztab$", "在复制时此占位符将被替换为横向制表符（ \\t ）。"),
+        new GenericItemModel("$filesize$", "在复制时此占位符将被替换为以“字节”为单位的文件大小值。"),
+        new GenericItemModel("$expected$", "在复制时此占位符将被替换为【校验值】列中本算法填入（或校验信息清单回填）的期望哈希值，未填写时为空。"),
+        new GenericItemModel("$cmp$", "在复制时此占位符将被替换为【校验结果】列中本算法的校验结果文字：一致 / 不一致 / 不确定 / 无关联 / 未校验。"),
     };
 
     [JsonIgnore, XmlIgnore]
@@ -2068,6 +2134,8 @@ public class SettingsViewModel : BaseViewModel, IJsonOnSerializing, IJsonOnDeser
         new GenericItemModel("$newline$", "导出计算结果时此占位符将被替换为 Unix 或 Windows 换行符。"),
         new GenericItemModel("$horztab$", "导出计算结果时此占位符将被替换为横向制表符（ \\t ）。"),
         new GenericItemModel("$filesize$", "导出计算结果时此占位符将被替换为以“字节”为单位的文件大小值。"),
+        new GenericItemModel("$expected$", "导出计算结果时此占位符将被替换为【校验值】列中本算法填入（或校验信息清单回填）的期望哈希值，未填写时为空。"),
+        new GenericItemModel("$cmp$", "导出计算结果时此占位符将被替换为【校验结果】列中本算法的校验结果文字：一致 / 不一致 / 不确定 / 无关联 / 未校验。"),
     };
 
     [JsonIgnore, XmlIgnore]

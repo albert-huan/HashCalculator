@@ -58,20 +58,11 @@ namespace HashCalculator
 
         private IEnumerable<string> EnumerateFiles(string root)
         {
-            IEnumerable<string> filePathsEnumerable;
             switch (this.searchMethod)
             {
                 default:
                 case SearchMethod.Children:
-                    try
-                    {
-                        filePathsEnumerable = Directory.EnumerateFiles(root);
-                    }
-                    catch (Exception)
-                    {
-                        yield break;
-                    }
-                    foreach (string file in filePathsEnumerable)
+                    foreach (string file in this.SafeEnumerateFiles(root))
                     {
                         yield return file;
                     }
@@ -83,27 +74,32 @@ namespace HashCalculator
                     while (directoryExplorer.Count != 0)
                     {
                         string currentDirectory = directoryExplorer.Pop();
+                        string[] subDirectories;
                         try
                         {
-                            filePathsEnumerable = Directory.EnumerateFiles(currentDirectory);
-                            string[] subDirectories = Directory.GetDirectories(currentDirectory);
-                            // Stack 后进先出的特性符合遍历文件的深度优先原则，但这个特性
-                            // 也会造成以倒序的方式遍历同级的目录，所以要翻转同级目录入栈顺序
-                            for (int i = subDirectories.Length - 1; i >= 0; --i)
-                            {
-                                string directory = subDirectories[i];
-                                if (!isPartitionRoot || !Path.GetFileName(directory).Equals(recyclebin,
-                                    StringComparison.OrdinalIgnoreCase))
-                                {
-                                    directoryExplorer.Push(directory);
-                                }
-                            }
+                            subDirectories = Directory.GetDirectories(currentDirectory);
                         }
                         catch (Exception)
                         {
                             continue;
                         }
-                        foreach (string fileInCurrentDirectory in filePathsEnumerable)
+                        // Stack 后进先出的特性符合遍历文件的深度优先原则，但这个特性
+                        // 也会造成以倒序的方式遍历同级的目录，所以要翻转同级目录入栈顺序
+                        for (int i = subDirectories.Length - 1; i >= 0; --i)
+                        {
+                            string directory = subDirectories[i];
+                            // 目录 junction / 符号链接可能形成环，导致无限递归和重复计算
+                            if (IsReparsePoint(directory))
+                            {
+                                continue;
+                            }
+                            if (!isPartitionRoot || !Path.GetFileName(directory).Equals(recyclebin,
+                                StringComparison.OrdinalIgnoreCase))
+                            {
+                                directoryExplorer.Push(directory);
+                            }
+                        }
+                        foreach (string fileInCurrentDirectory in this.SafeEnumerateFiles(currentDirectory))
                         {
                             yield return fileInCurrentDirectory;
                         }
@@ -111,6 +107,69 @@ namespace HashCalculator
                     break;
                 case SearchMethod.DontSearch:
                     break;
+            }
+        }
+
+        /// <summary>
+        /// Directory.EnumerateFiles 是延迟枚举，异常发生在 MoveNext 而不是创建时。
+        /// 逐次迭代包在 try 里，避免单个目录被删除/权限不足就让整批搜索中断。
+        /// </summary>
+        private IEnumerable<string> SafeEnumerateFiles(string root)
+        {
+            IEnumerator<string> enumerator = null;
+            try
+            {
+                enumerator = Directory.EnumerateFiles(root).GetEnumerator();
+            }
+            catch (Exception)
+            {
+                enumerator = null;
+            }
+            if (enumerator == null)
+            {
+                yield break;
+            }
+            try
+            {
+                while (true)
+                {
+                    string current = null;
+                    bool failed = false;
+                    try
+                    {
+                        if (!enumerator.MoveNext())
+                        {
+                            break;
+                        }
+                        current = enumerator.Current;
+                    }
+                    catch (Exception)
+                    {
+                        failed = true;
+                    }
+                    if (failed)
+                    {
+                        yield break;
+                    }
+                    yield return current;
+                }
+            }
+            finally
+            {
+                enumerator.Dispose();
+            }
+        }
+
+        private static bool IsReparsePoint(string directory)
+        {
+            try
+            {
+                return (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0;
+            }
+            catch (Exception)
+            {
+                // 属性都取不到的目录一律跳过，避免后续枚举再抛异常
+                return true;
             }
         }
 
