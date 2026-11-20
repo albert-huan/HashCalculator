@@ -296,13 +296,14 @@ public class AlgoInOutModel : BaseViewModel
     }
 
     /// <summary>CSV 字段转义：包双引号、双引号翻倍，并阻止表格软件把值当公式执行。</summary>
-    private static string EscapeCsvValue(string value)
+    internal static string EscapeCsvValue(string value, bool relativeFilePath = false)
     {
         value ??= string.Empty;
         if (value.Length > 0 && (value[0] == '=' || value[0] == '+' ||
             value[0] == '-' || value[0] == '@' || value[0] == '\t' || value[0] == '\r'))
         {
-            value = "'" + value;
+            // 文件路径可用合法的相对路径前缀保护，导入时仍能定位原文件。
+            value = relativeFilePath ? @".\" + value : "'" + value;
         }
         return "\"" + value.Replace("\"", "\"\"") + "\"";
     }
@@ -370,10 +371,12 @@ public class AlgoInOutModel : BaseViewModel
                         "$newline$" => lineBreak,
                         "$algo$" => CsvField(algoName),
                         "$hash$" => CsvField(BytesToStrByOutputTypeCvt.Convert(this.HashResult, output)),
-                        "$name$" => CsvField(parent.Information.Name),
+                        "$name$" => escapeCsv ? EscapeCsvValue(parent.Information.Name, relativeFilePath: true)
+                            : parent.Information.Name,
                         "$path$" => CsvField(parent.Arguments.Deprecated ?
                             parent.Information.Name : parent.Information.FullName),
-                        "$relpath$" => CsvField(parent.RelativePath),
+                        "$relpath$" => escapeCsv ? EscapeCsvValue(parent.RelativePath, relativeFilePath: true)
+                            : parent.RelativePath,
                         "$filesize$" => CsvField(parent.FileLength.ToString()),
                         "$expected$" => CsvField(this.ExpectedHashString ?? string.Empty),
                         "$cmp$" => CsvField(CmpResultToExportText(this.HashCmpResult)),

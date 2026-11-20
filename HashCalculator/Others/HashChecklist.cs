@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using HashCalculator.ViewModels.Pages;
 
 namespace HashCalculator;
@@ -27,7 +28,7 @@ public class HashChecker
     /// </summary>
     private byte[][] hashByteLists = Array.Empty<byte[]>();
 
-    public bool IsExistingFile { get; set; }
+    internal bool IsExplicitPath { get; set; }
 
     /// <summary>
     /// 清单里是否存在不带文件名的条目（纯哈希列表）。这类清单的哈希值与具体行无法一一对应，
@@ -87,16 +88,28 @@ public class HashChecker
         }
         if (firstIndex < 0)
         {
-            // 清单里没有记录该算法时，用记录为 UNKNOWN（算法未知）的哈希值判断
+            byte[] candidate = null;
             for (int i = 0; i < this.itemCount; ++i)
             {
                 if (this.algoTypes[i] == AlgoType.UNKNOWN &&
-                    BytesComparer.Default.Equals(this.hashByteLists[i], hashBytes))
+                    this.hashByteLists[i].Length == hashBytes.Length)
                 {
-                    return CmpRes.Matched;
+                    byte[] value = this.hashByteLists[i];
+                    if (this.fileIndependent)
+                    {
+                        if (BytesComparer.Default.Equals(value, hashBytes))
+                            return CmpRes.Matched;
+                    }
+                    else
+                    {
+                        if (candidate != null && !BytesComparer.Default.Equals(candidate, value))
+                            return CmpRes.Uncertain;
+                        candidate = value;
+                    }
                 }
             }
-            return CmpRes.Unrelated;
+            return candidate == null ? CmpRes.Unrelated :
+                BytesComparer.Default.Equals(candidate, hashBytes) ? CmpRes.Matched : CmpRes.Uncertain;
         }
         return BytesComparer.Default.Equals(this.hashByteLists[firstIndex], hashBytes) ?
             CmpRes.Matched : this.fileIndependent ? CmpRes.Unrelated : CmpRes.Mismatch;
@@ -259,7 +272,10 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
 
     private static Encoding[] _supportedEncodings = null;
     private static readonly char[] directorySeparators = new char[] { '/', '\\' };
+    private static readonly char[] invalidFileNameChars = Path.GetInvalidFileNameChars();
     private Dictionary<string, HashChecker> fileHashCheckerDict = null;
+    private Dictionary<string, HashChecker> resolvedNames;
+    private readonly Dictionary<int, AlgoType> inferredAlgorithms = new();
 
     /// <summary>
     /// 统一的文件哈希表访问入口：字典惰性创建，保证任何实例（包括仅经无参构造、
@@ -307,7 +323,9 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
 
     public string ReasonForFailure { get; private set; }
 
-    public bool KeysAreRelativePaths { get; private set; }
+    internal string SourceDirectory { get; private set; }
+    internal bool HasNamedEntries => this.FileHashCheckerDict.Count >
+        (this.FileHashCheckerDict.ContainsKey(string.Empty) ? 1 : 0);
 
     IEnumerator IEnumerable.GetEnumerator()
     {
@@ -319,23 +337,15 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
         return this.FileHashCheckerDict.GetEnumerator();
     }
 
-    private void Initialize()
+    private void Initialize(bool keepSource = false)
     {
         this.ReasonForFailure = null;
-        this.KeysAreRelativePaths = false;
+        if (!keepSource)
+            this.SourceDirectory = null;
+        this.resolvedNames = null;
+        this.inferredAlgorithms.Clear();
         // 惰性属性保证字典存在，清空即可；不再需要单独处理"首次创建"
         this.FileHashCheckerDict.Clear();
-    }
-
-    public bool IsNameInChecklist(string fileName)
-    {
-        if (!string.IsNullOrEmpty(fileName) &&
-            this.FileHashCheckerDict.TryGetValue(fileName, out HashChecker value))
-        {
-            value.IsExistingFile = true;
-            return true;
-        }
-        return false;
     }
 
     public bool AddChecklistItem(string algo, string hash, string relpath)
@@ -352,26 +362,26 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
         if (CommonUtils.HashBytesFromString(hash) is byte[] hashBytes &&
             CommonUtils.IsSupportedDigestLength(hashBytes.Length))
         {
-            relpath = relpath.Replace('/', '\\');
+            bool explicitPath = relpath.IndexOfAny(directorySeparators) >= 0;
+            if (relpath.Length != 0 && !TryNormalizeRelativeKey(relpath, out relpath))
+            {
+                return false;
+            }
             if (!this.FileHashCheckerDict.TryGetValue(relpath, out HashChecker hashChecker))
             {
                 hashChecker = new HashChecker();
                 this.FileHashCheckerDict[relpath] = hashChecker;
             }
-            // 从校验信息文件内容和扩展名推断 algoType 后，无论是否仍是 UNKNOWN，都添加到 HashChecker
-            hashChecker.AddCheckerItem(relpath, algoType, hashBytes);
-            // 如果 algoType 仍然是 UNKNOWN，则假定解析校验信息所得哈希值对应算法与启动校验时指定的算法相同
-            // 遍历启动校验时用户指定的算法，如该算法的摘要长度与 hashBytes 长度相同则添加到 HashChecker
-            if (algoType == AlgoType.UNKNOWN && this.AlgoTypesFromOption?.Length > 0)
+            hashChecker.IsExplicitPath |= explicitPath;
+            if (algoType == AlgoType.UNKNOWN && relpath.Length != 0)
             {
-                foreach (AlgoType fallbackAlgoType in this.AlgoTypesFromOption)
+                if (!this.inferredAlgorithms.TryGetValue(hashBytes.Length, out algoType))
                 {
-                    if (fallbackAlgoType.DigestLength() == hashBytes.Length)
-                    {
-                        hashChecker.AddCheckerItem(relpath, fallbackAlgoType, hashBytes);
-                    }
+                    algoType = AlgorithmsModel.InferChecklistAlgorithm(hashBytes.Length, this.AlgoTypesFromOption);
+                    this.inferredAlgorithms.Add(hashBytes.Length, algoType);
                 }
             }
+            hashChecker.AddCheckerItem(relpath, algoType, hashBytes);
             return true;
         }
         return false;
@@ -424,8 +434,10 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
     public string UpdateWithFile(string filePath)
     {
         this.Initialize();
+        this.AlgoTypeFromFileExt = AlgoType.UNKNOWN;
         try
         {
+            this.SourceDirectory = Path.GetDirectoryName(Path.GetFullPath(filePath));
             string fileExt = Path.GetExtension(filePath);
             if (AlgorithmsModel.TryGetAlgoType(fileExt.TrimStart('.'),
                 out AlgoType algoType))
@@ -450,11 +462,11 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
                         {
                             return this.ReasonForFailure;
                         }
-                        this.Initialize();
+                        this.Initialize(keepSource: true);
                     }
                     catch (DecoderFallbackException)
                     {
-                        this.Initialize();
+                        this.Initialize(keepSource: true);
                     }
                 }
             }
@@ -634,6 +646,7 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
         bool anyPaser = false;
         bool anyItemAdded = false;
         this.Initialize();
+        this.AlgoTypeFromFileExt = AlgoType.UNKNOWN;
         foreach (TemplateForChecklistModel parser in GetParsers(null))
         {
             anyPaser = true;
@@ -673,7 +686,8 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
         this.AlgoTypesFromOption = checklist.AlgoTypesFromOption;
         this.AlgoTypeFromFileExt = checklist.AlgoTypeFromFileExt;
         this.ReasonForFailure = checklist.ReasonForFailure;
-        this.KeysAreRelativePaths = checklist.KeysAreRelativePaths;
+        this.SourceDirectory = checklist.SourceDirectory;
+        this.resolvedNames = checklist.resolvedNames;
         checklist.fileHashCheckerDict = null;
         checklist.Initialize();
         return this.ReasonForFailure;
@@ -682,112 +696,111 @@ public class HashChecklist : IEnumerable<KeyValuePair<string, HashChecker>>
     public bool TryGetFileHashChecker(string mapKey, out HashChecker checker)
     {
         checker = null;
-        if (mapKey == null)
-        {
-            return false;
-        }
-        if (!this.KeysAreRelativePaths)
-        {
-            mapKey = Path.GetFileName(mapKey);
-        }
-        if (this.FileHashCheckerDict.TryGetValue(mapKey, out checker))
-        {
-            return true;
-        }
-        // 清单里记的是纯文件名（如【文件名+制表符+哈希值】导出方案），
-        // 即使被判定为相对路径清单，也要能用文件名匹配到子目录里的文件
-        return this.KeysAreRelativePaths &&
-            this.FileHashCheckerDict.TryGetValue(Path.GetFileName(mapKey), out checker);
+        return TryNormalizeRelativeKey(mapKey, out string key) &&
+            (this.FileHashCheckerDict.TryGetValue(key, out checker) ||
+                (this.resolvedNames?.TryGetValue(key, out checker) ?? false));
     }
 
-    public bool TryGetFileOrEmptyStrHashChecker(string mapKey, out HashChecker checker)
+    internal bool TryGetFileHashChecker(string fullPath, string relativePath, out HashChecker checker)
     {
         checker = null;
-        if (mapKey == null || this.FileHashCheckerDict.Count == 0)
+        string key = this.SourceDirectory == null ? relativePath :
+            Path.IsPathFullyQualified(fullPath) ? Path.GetRelativePath(this.SourceDirectory, fullPath) : null;
+        return this.TryGetFileHashChecker(key, out checker);
+    }
+
+    internal bool TryGetFileOrEmptyStrHashChecker(string fullPath, string relativePath, out HashChecker checker)
+    {
+        return this.TryGetFileHashChecker(fullPath, relativePath, out checker) ||
+            this.FileHashCheckerDict.TryGetValue(string.Empty, out checker);
+    }
+
+    private static bool TryNormalizeRelativeKey(string key, out string normalized)
+    {
+        normalized = null;
+        if (string.IsNullOrWhiteSpace(key) || Path.IsPathRooted(key) || IsSeparator(key[^1]))
         {
             return false;
         }
-        if (!this.KeysAreRelativePaths)
+        if (key.IndexOfAny(directorySeparators) < 0)
         {
-            mapKey = Path.GetFileName(mapKey);
-        }
-        if (this.FileHashCheckerDict.TryGetValue(mapKey, out checker))
-        {
+            if (!IsUsablePathPart(key))
+                return false;
+            normalized = key;
             return true;
         }
-        if (this.KeysAreRelativePaths &&
-            this.FileHashCheckerDict.TryGetValue(Path.GetFileName(mapKey), out checker))
+        string[] parts = key.Split(directorySeparators, StringSplitOptions.RemoveEmptyEntries);
+        int count = 0;
+        foreach (string part in parts)
         {
-            return true;
+            if (part == ".")
+                continue;
+            if (!IsUsablePathPart(part))
+                return false;
+            parts[count++] = part;
         }
-        // 无文件名的纯哈希清单：对每一行都适用
-        return this.FileHashCheckerDict.TryGetValue(string.Empty, out checker);
-    }
-
-    /// <summary>
-    /// 校验清单里的文件标识必须是安全的相对路径：拒绝绝对路径、盘符、含 ".." 的回退路径。
-    /// 否则 Path.Combine 会丢弃 rootDir，程序会去计算清单目录之外的文件。
-    /// </summary>
-    private static bool IsUnsafeRelativeKey(string key)
-    {
-        if (string.IsNullOrWhiteSpace(key) || Path.IsPathRooted(key) ||
-            key[0] == '\\' || key[0] == '/' || key.IndexOf(':') >= 0)
-        {
-            return true;
-        }
-        foreach (string part in key.Split(directorySeparators))
-        {
-            if (part == "..")
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// 断言 HashChecklist 里所有文件标识都是相对路径并取得所有文件完整路径
-    /// </summary>
-    public bool AssertRelativeGetFull(string rootDir, out IEnumerable<string> fullPaths)
-    {
-        fullPaths = null;
-        if (string.IsNullOrWhiteSpace(rootDir) || this.FileHashCheckerDict.Count == 0 ||
-            this.FileHashCheckerDict.Keys.Any(IsUnsafeRelativeKey))
-        {
+        if (count == 0)
             return false;
-        }
-        try
+        normalized = string.Join('\\', parts, 0, count);
+        return true;
+    }
+
+    private static bool IsSeparator(char c) => c == '\\' || c == '/';
+
+    private static bool IsUsablePathPart(string part) =>
+        part[^1] != '.' && part[^1] != ' ' && part.IndexOfAny(invalidFileNameChars) < 0;
+
+    internal List<(string Path, string Error)> ResolveFileEntries(string root,
+        Func<IEnumerable<string>> enumerateFiles, CancellationToken token)
+    {
+        var entries = new List<(string Path, string Error)>();
+        var unresolved = new Dictionary<string, (string Candidate, bool Ambiguous)>(StringComparer.OrdinalIgnoreCase);
+        var resolved = new Dictionary<string, HashChecker>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, checker) in this.FileHashCheckerDict)
         {
-            // 如果所有 Key 都不含 "\" 或 "/" 则进一步判断是否是相对路径
-            if (!this.FileHashCheckerDict.Keys.Any(i => i.IndexOfAny(directorySeparators) != -1))
+            if (token.IsCancellationRequested)
+                return entries;
+            if (key.Length == 0)
+                continue;
+            string path = Path.Combine(root, key);
+            if (System.IO.File.Exists(path))
+                entries.Add((path, null));
+            else if (checker.IsExplicitPath)
+                entries.Add((path, "找不到清单指定的文件。"));
+            else
+                unresolved.Add(key, (null, false));
+        }
+        if (unresolved.Count != 0)
+        {
+            foreach (string path in enumerateFiles())
             {
-                List<string> filePathList = new List<string>();
-                foreach (KeyValuePair<string, HashChecker> pair in this.FileHashCheckerDict)
+                if (token.IsCancellationRequested)
+                    return entries;
+                string name = Path.GetFileName(path);
+                if (unresolved.TryGetValue(name, out var match) && !match.Ambiguous)
                 {
-                    string filePath = Path.Combine(rootDir, pair.Key);
-                    if (!System.IO.File.Exists(filePath))
-                    {
-                        // 有一个路径找不到文件，则视所有 Key 为非相对路径，
-                        // 调用者需要自行枚举文件找到目标
-                        return false;
-                    }
-                    filePathList.Add(filePath);
+                    unresolved[name] = (match.Candidate ?? path, match.Candidate != null);
                 }
-                fullPaths = filePathList;
-                this.KeysAreRelativePaths = true;
-                return true;
             }
-            // 只要某个 Key 含有一个 "\" 或 "/" 则视所有 Key 为相对路径，不管文件是否存在
-            fullPaths = this.FileHashCheckerDict.Keys
-                .Select(rel => Path.Combine(rootDir, rel)).ToArray();
-            this.KeysAreRelativePaths = true;
-            return true;
+            foreach (var (key, match) in unresolved)
+            {
+                if (match.Ambiguous || match.Candidate == null)
+                {
+                    entries.Add((Path.Combine(root, key), match.Ambiguous
+                        ? "有多个同名文件，请在清单中指定相对路径。" : "找不到清单指定的文件。"));
+                    continue;
+                }
+                string relative = Path.GetRelativePath(root, match.Candidate);
+                if (this.FileHashCheckerDict.ContainsKey(relative))
+                {
+                    entries.Add((Path.Combine(root, key), "该文件已有显式路径条目，请检查清单。"));
+                    continue;
+                }
+                resolved.Add(relative, this.FileHashCheckerDict[key]);
+                entries.Add((match.Candidate, null));
+            }
         }
-        catch (Exception ex) when (ex is ArgumentException ||
-            ex is NotSupportedException || ex is PathTooLongException)
-        {
-            // 文件名含通配符等非法字符时 Path.Combine / File.Exists 可能抛异常
-            return false;
-        }
+        this.resolvedNames = resolved;
+        return entries;
     }
 }

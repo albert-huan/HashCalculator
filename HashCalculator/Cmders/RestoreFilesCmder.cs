@@ -79,84 +79,38 @@ internal class RestoreFilesCmder : AbsHashesCmder
         }
     }
 
-    private async Task<string> RestoreMarkedFiles(IEnumerable<HashViewModel> models,
+    private Task<string> RestoreMarkedFiles(HashViewModel[] models,
         ProgressWindow doubleProgressWindow, ProgressWindowModel doubleProgressModel)
     {
-        try
+        var option = this.RestoreFilesOption;
+        string destination = this.DirectoryUsedToSaveFiles;
+        var token = doubleProgressModel.TokenSrc.Token;
+        return MarkedFileBatch.RunAsync(models, doubleProgressWindow, doubleProgressModel, model =>
         {
-            doubleProgressModel.TotalCount = models.Count();
-            await Task.Run(() =>
+            using FileStream source = option == EditFileOption.OriginalFile ?
+                model.Information.Open(FileMode.Open, FileAccess.ReadWrite) : model.Information.OpenRead();
+            var helper = new HcmDataHelper(source);
+            if (!helper.ReadHcmData(out var data) || !data.DataReliable || data.Position < 0)
+                return "没有有效的哈希标记。";
+            token.ThrowIfCancellationRequested();
+            if (option == EditFileOption.OriginalFile)
             {
-                foreach (HashViewModel model in models)
+                helper.RestoreOriginal(data);
+                Synchronization.UI.Invoke(() =>
                 {
-                    doubleProgressModel.CurrentValue = 0.0;
-                    doubleProgressModel.CurrentString = model.FileName;
-                    try
-                    {
-                        string outputDirectory = string.Empty;
-                        switch (this.RestoreFilesOption)
-                        {
-                            case EditFileOption.OriginalFile:
-                                using (FileStream fileStream = model.Information.Open(
-                                    FileMode.Open, FileAccess.ReadWrite))
-                                {
-                                    if (new HcmDataHelper(fileStream).RestoreMarkedFile())
-                                    {
-                                        model.HcmDataFromFile = null;
-                                        model.EmbeddedHashGroupID = null;
-                                    }
-                                }
-                                goto RoundEndsAndNext;
-                            case EditFileOption.NewInNewLocation:
-                                outputDirectory = this.DirectoryUsedToSaveFiles;
-                                break;
-                            default:
-                            case EditFileOption.NewInSameLocation:
-                                outputDirectory = model.Information.DirectoryName;
-                                break;
-                        }
-                        string extension = Path.GetExtension(model.FileName);
-                        string nameNoExt = Path.GetFileNameWithoutExtension(model.FileName);
-                        int duplicate = -1;
-                        string newFilePath;
-                        do
-                        {
-                            string newFileName = ++duplicate == 0 ? $"{nameNoExt}{extension}" :
-                                $"{nameNoExt}_{duplicate}{extension}";
-                            newFilePath = Path.Combine(outputDirectory, newFileName);
-                        } while (File.Exists(newFilePath));
-                        bool result = true;
-                        using (FileStream fileStream = model.Information.OpenRead())
-                        using (FileStream newFileStream = File.Create(newFilePath))
-                        {
-                            HcmDataHelper hcmDataHelper = new HcmDataHelper(fileStream);
-                            result = hcmDataHelper.RestoreMarkedFile(newFileStream, doubleProgressModel);
-                        }
-                        if (!result && File.Exists(newFilePath))
-                        {
-                            File.Delete(newFilePath);
-                        }
-                    }
-                    catch (Exception) { }
-                RoundEndsAndNext:
-                    doubleProgressModel.ProcessedCount += 1;
-                    if (doubleProgressModel.TokenSrc.IsCancellationRequested)
-                    {
-                        break;
-                    }
-                }
-            });
-            return default(string);
-        }
-        catch (Exception exception)
-        {
-            return exception.Message;
-        }
-        finally
-        {
-            doubleProgressModel.AutoClose = true;
-            doubleProgressWindow.DialogResult = false;
-        }
+                    model.HcmDataFromFile = null;
+                    model.EmbeddedHashGroupID = null;
+                });
+                return null;
+            }
+            string directory = option == EditFileOption.NewInNewLocation ? destination : model.Information.DirectoryName;
+            MarkedFileBatch.WriteCopy(directory, model.FileName, output =>
+            {
+                if (!helper.RestoreMarkedFile(output, data, doubleProgressModel))
+                    throw new IOException("未能完整读取原文件内容。");
+            }, token);
+            return null;
+        });
     }
 
     private async void RestoreMarkedFilesAction(object param)
@@ -203,7 +157,7 @@ internal class RestoreFilesCmder : AbsHashesCmder
             }
             if (hashViewModels.Any(i => i.IsExecutionTarget))
             {
-                IEnumerable<HashViewModel> targets = hashViewModels.Where(i => i.IsExecutionTarget);
+                HashViewModel[] targets = hashViewModels.Where(i => i.IsExecutionTarget).ToArray();
                 ProgressWindowModel progressModel = new ProgressWindowModel()
                 {
                     WindowTitle = "正在还原...",
@@ -214,12 +168,7 @@ internal class RestoreFilesCmder : AbsHashesCmder
                 };
                 Task<string> restoreMarkedFilesTask = this.RestoreMarkedFiles(targets, progressWindow, progressModel);
                 progressWindow.ShowDialog();
-                string exceptionMessage = await restoreMarkedFilesTask;
-                if (!string.IsNullOrEmpty(exceptionMessage))
-                {
-                    NotificationSender.ShowMessageBox(
-                        MainWindow.Current, "错误", $"出现异常导致过程中断：{exceptionMessage}");
-                }
+                NotificationSender.ShowMessageBox(MainWindow.Current, "还原文件结果", await restoreMarkedFilesTask);
             }
             else
             {

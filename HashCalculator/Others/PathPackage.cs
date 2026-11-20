@@ -10,7 +10,6 @@ namespace HashCalculator
     public class PathPackage : IEnumerable<HashModelArg>
     {
         private static readonly string recyclebin = "$Recycle.Bin";
-        private static readonly char[] invalidFnameChars = Path.GetInvalidFileNameChars();
 
         private readonly string[] paths = null;
         private readonly SearchMethod searchMethod;
@@ -46,6 +45,21 @@ namespace HashCalculator
             this.hashChecklist = checklist;
         }
 
+        internal static string ResolveChecklistNames(HashChecklist checklist, SearchMethod method)
+        {
+            if (checklist.SourceDirectory is string root && checklist.HasNamedEntries)
+            {
+                PathPackage package = new PathPackage(root, root, method);
+                foreach (var (path, error) in checklist.ResolveFileEntries(
+                    root, () => package.EnumerateFiles(root), CancellationToken.None))
+                {
+                    if (error != null)
+                        return $"{Path.GetFileName(path)}：{error}";
+                }
+            }
+            return null;
+        }
+
         IEnumerator IEnumerable.GetEnumerator()
         {
             return this.EnumerateModelArgs();
@@ -71,7 +85,7 @@ namespace HashCalculator
                     bool isPartitionRoot = root.EndsWith(":\\");
                     Stack<string> directoryExplorer = new Stack<string>();
                     directoryExplorer.Push(root);
-                    while (directoryExplorer.Count != 0)
+                    while (directoryExplorer.Count != 0 && !this.StopSearchingToken.IsCancellationRequested)
                     {
                         string currentDirectory = directoryExplorer.Pop();
                         string[] subDirectories;
@@ -175,100 +189,40 @@ namespace HashCalculator
 
         private IEnumerator<HashModelArg> EnumerateModelArgs()
         {
-            if (this.hashChecklist == null)
+            if (this.hashChecklist?.SourceDirectory is string checklistRoot &&
+                this.OnlyFilesThatExistInChecklist && this.hashChecklist.HasNamedEntries)
             {
-                foreach (string path in this.paths ?? Array.Empty<string>())
+                foreach (var (path, error) in this.hashChecklist.ResolveFileEntries(checklistRoot,
+                    () => this.EnumerateFiles(checklistRoot), this.StopSearchingToken))
                 {
                     if (this.StopSearchingToken.IsCancellationRequested)
-                    {
                         yield break;
-                    }
-                    if (File.Exists(path))
+                    yield return new HashModelArg(checklistRoot, path, this.PresetAlgoTypes, this.hashChecklist)
                     {
-                        yield return new HashModelArg(this.parentDir, path, this.PresetAlgoTypes,
-                            this.hashChecklist);
-                    }
-                    else if (Directory.Exists(path))
-                    {
-                        foreach (string fileFullPath in this.EnumerateFiles(path))
-                        {
-                            if (this.StopSearchingToken.IsCancellationRequested)
-                            {
-                                yield break;
-                            }
-                            yield return new HashModelArg(this.parentDir, fileFullPath, this.PresetAlgoTypes,
-                                this.hashChecklist);
-                        }
-                    }
+                        Deprecated = error != null,
+                        Message = error
+                    };
                 }
+                yield break;
             }
-            else
+            foreach (string path in this.paths ?? Array.Empty<string>())
             {
-                if (this.hashChecklist.AssertRelativeGetFull(this.parentDir,
-                    out IEnumerable<string> fullPaths))
+                if (this.StopSearchingToken.IsCancellationRequested)
                 {
-                    foreach (string path in fullPaths)
-                    {
-                        if (this.StopSearchingToken.IsCancellationRequested)
-                        {
-                            yield break;
-                        }
-                        HashModelArg argument = new HashModelArg(this.parentDir, path,
-                            this.PresetAlgoTypes, this.hashChecklist);
-                        if (!File.Exists(path))
-                        {
-                            argument.Deprecated = true;
-                            argument.Message = "找不到文件，可能校验信息文件与此文件相对位置不正确";
-                        }
-                        yield return argument;
-                    }
+                    yield break;
                 }
-                else
+                if (File.Exists(path))
                 {
-                    foreach (string path in this.paths ?? Array.Empty<string>())
+                    yield return new HashModelArg(this.parentDir, path, this.PresetAlgoTypes, this.hashChecklist);
+                }
+                else if (Directory.Exists(path))
+                {
+                    foreach (string fileFullPath in this.EnumerateFiles(path))
                     {
                         if (this.StopSearchingToken.IsCancellationRequested)
-                        {
                             yield break;
-                        }
-                        if (File.Exists(path))
-                        {
-                            yield return new HashModelArg(this.parentDir, path, this.PresetAlgoTypes,
-                                this.hashChecklist);
-                        }
-                        else if (Directory.Exists(path))
-                        {
-                            foreach (string fileFullPath in this.EnumerateFiles(path))
-                            {
-                                if (this.StopSearchingToken.IsCancellationRequested)
-                                {
-                                    yield break;
-                                }
-                                if (!this.hashChecklist.IsNameInChecklist(Path.GetFileName(fileFullPath)) &&
-                                    this.OnlyFilesThatExistInChecklist)
-                                {
-                                    continue;
-                                }
-                                yield return new HashModelArg(this.parentDir, fileFullPath,
-                                    this.PresetAlgoTypes, this.hashChecklist);
-                            }
-                            foreach (KeyValuePair<string, HashChecker> pair in this.hashChecklist)
-                            {
-                                if (this.StopSearchingToken.IsCancellationRequested)
-                                {
-                                    yield break;
-                                }
-                                if (string.IsNullOrEmpty(pair.Key) || pair.Key.IndexOfAny(invalidFnameChars) != -1)
-                                {
-                                    yield return new HashModelArg(this.PresetAlgoTypes);
-                                }
-                                // 此属性由 HashChecklist.IsNameInChecklist 方法更改
-                                else if (!pair.Value.IsExistingFile)
-                                {
-                                    yield return new HashModelArg(pair.Key, this.PresetAlgoTypes);
-                                }
-                            }
-                        }
+                        yield return new HashModelArg(this.parentDir, fileFullPath, this.PresetAlgoTypes,
+                            this.hashChecklist);
                     }
                 }
             }

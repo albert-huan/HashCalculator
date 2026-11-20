@@ -26,26 +26,10 @@ namespace HashCalculator
             return stream != null && stream.CanSeek && stream.CanWrite;
         }
 
-        private static bool AvailableInOutModel(AlgoInOutModel model)
+        internal static bool AvailableInOutModel(AlgoInOutModel model)
         {
             return model == null || (model.AlgoType != AlgoType.UNKNOWN &&
                 model.HashResult?.Length > 0);
-        }
-
-        private static bool SetStreamLength(FileStream fileStream, long position)
-        {
-            if (position > 0L)
-            {
-                try
-                {
-                    fileStream.SetLength(position);
-                    return true;
-                }
-                catch (Exception)
-                {
-                }
-            }
-            return false;
         }
 
         private bool UseableExternal(Stream stream)
@@ -55,10 +39,14 @@ namespace HashCalculator
 
         private bool InternalStreamCopyTo(Stream stream, long start, long count, ProgressWindowModel progress)
         {
-            if (start < 0L || count <= 0L || start + count > this._stream.Length)
+            var token = progress.TokenSrc.Token;
+            token.ThrowIfCancellationRequested();
+            if (start < 0L || count < 0L || start > this._stream.Length - count)
             {
                 return false;
             }
+            if (count == 0)
+                return true;
             byte[] buffer = null;
             try
             {
@@ -70,6 +58,7 @@ namespace HashCalculator
                 int plannedReadCount = buffer.Length;
                 while (remainingCount > 0L)
                 {
+                    token.ThrowIfCancellationRequested();
                     if (plannedReadCount > remainingCount)
                     {
                         plannedReadCount = (int)remainingCount;
@@ -85,14 +74,10 @@ namespace HashCalculator
                 }
                 return remainingCount == 0L;
             }
-            catch (Exception)
-            {
-            }
             finally
             {
                 CommonUtils.MakeSureBuffer(ref buffer, 0);
             }
-            return false;
         }
 
         private bool WriteHcmData(Stream stream, AlgoInOutModel model)
@@ -155,26 +140,9 @@ namespace HashCalculator
             return new HcmDataHelper(stream).ReadHcmData(out hcmData);
         }
 
-        /// <summary>
-        /// 从带有哈希标记 (HCM 标记) 的文件中还原出无标记的文件。
-        /// </summary>
-        public bool RestoreMarkedFile()
+        internal void RestoreOriginal(HcmData hcmData)
         {
-            return StreamWritable(this._stream) &&
-                this.ReadHcmData(out HcmData hcmData) &&
-                hcmData.DataReliable &&
-                SetStreamLength(this._stream as FileStream, hcmData.Position);
-        }
-
-        /// <summary>
-        /// 从带有哈希标记 (HCM 标记) 的文件中还原出无标记的文件。
-        /// </summary>
-        public bool RestoreMarkedFile(Stream newStream, ProgressWindowModel progress)
-        {
-            return this.UseableExternal(newStream) &&
-                this.ReadHcmData(out HcmData hcmData) &&
-                hcmData.DataReliable &&
-                this.InternalStreamCopyTo(newStream, 0L, hcmData.Position, progress);
+            this._stream.SetLength(hcmData.Position);
         }
 
         /// <summary>

@@ -72,85 +72,42 @@ internal class MarkFilesCmder : AbsHashesCmder
         }
     }
 
-    private async Task<string> GenerateMarkedFiles(IEnumerable<HashViewModel> models,
+    private Task<string> GenerateMarkedFiles(HashViewModel[] models,
         ProgressWindow doubleProgressWindow, ProgressWindowModel doubleProgressModel)
     {
-        try
+        var option = this.MarkFilesOption;
+        string destination = this.DirectoryUsedToSaveFiles;
+        var token = doubleProgressModel.TokenSrc.Token;
+        return MarkedFileBatch.RunAsync(models, doubleProgressWindow, doubleProgressModel, model =>
         {
-            IEnumerable<HashViewModel> validModels = models.Where(
-                i => i.Result == HashResult.NoResult || i.Result == HashResult.Succeeded);
-            doubleProgressModel.TotalCount = validModels.Count();
-            await Task.Run(() =>
+            if (model.Result != HashResult.NoResult && model.Result != HashResult.Succeeded)
+                return "文件任务未成功。";
+            var algorithm = model.CurrentInOutModel;
+            if (!HcmDataHelper.AvailableInOutModel(algorithm))
+                return "当前算法没有可用的哈希值。";
+            if (option == EditFileOption.OriginalFile)
             {
-                foreach (HashViewModel model in validModels)
+                using FileStream stream = model.Information.Open(FileMode.Open, FileAccess.Write);
+                token.ThrowIfCancellationRequested();
+                long originalLength = stream.Length;
+                if (!new HcmDataHelper(stream).GenerateMarkedFile(algorithm))
                 {
-                    doubleProgressModel.CurrentValue = 0.0;
-                    doubleProgressModel.CurrentString = model.FileName;
-                    try
-                    {
-                        string outputDirectory = string.Empty;
-                        switch (this.MarkFilesOption)
-                        {
-                            case EditFileOption.OriginalFile:
-                                using (FileStream stream = model.Information.Open(FileMode.Open,
-                                    FileAccess.Write))
-                                {
-                                    new HcmDataHelper(stream).GenerateMarkedFile(model.CurrentInOutModel);
-                                }
-                                goto RoundEndsAndNext;
-                            default:
-                            case EditFileOption.NewInSameLocation:
-                                outputDirectory = model.Information.DirectoryName;
-                                break;
-                            case EditFileOption.NewInNewLocation:
-                                outputDirectory = this.DirectoryUsedToSaveFiles;
-                                break;
-                        }
-                        string extension = Path.GetExtension(model.FileName);
-                        string nameNoExt = Path.GetFileNameWithoutExtension(model.FileName);
-                        int duplicate = -1;
-                        string newFilePath;
-                        do
-                        {
-                            string newFileName = ++duplicate == 0 ? $"{nameNoExt}{extension}" :
-                                $"{nameNoExt}_{duplicate}{extension}";
-                            newFilePath = Path.Combine(outputDirectory, newFileName);
-                        } while (File.Exists(newFilePath));
-                        bool result = true;
-                        using (FileStream fileStream = model.Information.OpenRead())
-                        using (FileStream newFileStream = File.Create(newFilePath))
-                        {
-                            HcmDataHelper hcmDataHelper = new HcmDataHelper(fileStream);
-                            result = hcmDataHelper.GenerateMarkedFile(newFileStream, model.CurrentInOutModel,
-                                doubleProgressModel);
-                        }
-                        if (!result && File.Exists(newFilePath))
-                        {
-                            File.Delete(newFilePath);
-                        }
-                    }
-                    catch (Exception)
-                    {
-                    }
-                RoundEndsAndNext:
-                    doubleProgressModel.ProcessedCount += 1;
-                    if (doubleProgressModel.TokenSrc.IsCancellationRequested)
-                    {
-                        break;
-                    }
+                    if (stream.Length != originalLength)
+                        stream.SetLength(originalLength);
+                    throw new IOException("无法写入哈希标记。");
                 }
-            });
-            return default(string);
-        }
-        catch (Exception exception)
-        {
-            return exception.Message;
-        }
-        finally
-        {
-            doubleProgressModel.AutoClose = true;
-            doubleProgressWindow.DialogResult = false;
-        }
+                return null;
+            }
+            using FileStream source = model.Information.OpenRead();
+            var helper = new HcmDataHelper(source);
+            string directory = option == EditFileOption.NewInNewLocation ? destination : model.Information.DirectoryName;
+            MarkedFileBatch.WriteCopy(directory, model.FileName, output =>
+            {
+                if (!helper.GenerateMarkedFile(output, algorithm, doubleProgressModel))
+                    throw new IOException("无法生成带标记的副本。");
+            }, token);
+            return null;
+        });
     }
 
     private async void GenerateMarkedFilesAction(object param)
@@ -197,7 +154,7 @@ internal class MarkFilesCmder : AbsHashesCmder
             }
             if (hashViewModels.Any(i => i.IsExecutionTarget))
             {
-                IEnumerable<HashViewModel> targets = hashViewModels.Where(i => i.IsExecutionTarget);
+                HashViewModel[] targets = hashViewModels.Where(i => i.IsExecutionTarget).ToArray();
                 ProgressWindowModel progressModel = new ProgressWindowModel()
                 {
                     WindowTitle = "正在写入...",
@@ -208,13 +165,7 @@ internal class MarkFilesCmder : AbsHashesCmder
                 };
                 Task<string> genMarkedFilesTask = this.GenerateMarkedFiles(targets, progressWindow, progressModel);
                 progressWindow.ShowDialog();
-                string exceptionMessage = await genMarkedFilesTask;
-                if (!string.IsNullOrEmpty(exceptionMessage))
-                {
-                    NotificationSender.ShowMessageBox(
-                        MainWindow.Current, "错误", $"出现异常导致过程中断：{exceptionMessage}");
-                    goto FinishingTouches;
-                }
+                NotificationSender.ShowMessageBox(MainWindow.Current, "添加标记结果", await genMarkedFilesTask);
             }
             else
             {

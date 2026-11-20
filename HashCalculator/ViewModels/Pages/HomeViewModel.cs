@@ -32,6 +32,7 @@ public class HomeViewModel : BaseViewModel
     private NavigationService navigationService = null;
     private string hashCheckReport = string.Empty;
     private string hashValueStringOrChecklistPath = null;
+    private int checklistRequestVersion;
     private JobStatus batchStatus = JobStatus.None;
 
     private RelayCommand mainWindowTopmostCmd;
@@ -159,7 +160,14 @@ public class HomeViewModel : BaseViewModel
     public string HashStringOrChecklistPath
     {
         get => this.hashValueStringOrChecklistPath;
-        set => this.SetPropNotify(ref this.hashValueStringOrChecklistPath, value);
+        set
+        {
+            if (!string.Equals(this.hashValueStringOrChecklistPath, value, StringComparison.Ordinal))
+            {
+                this.checklistRequestVersion++;
+                this.SetPropNotify(ref this.hashValueStringOrChecklistPath, value);
+            }
+        }
     }
 
     public JobStatus BatchStatus
@@ -227,12 +235,12 @@ public class HomeViewModel : BaseViewModel
         return default(HashChecklist);
     }
 
-    public void CheckHashUseClipboardText()
+    public async void CheckHashUseClipboardText()
     {
         if (HashModelStore.HashViewModels.AnyItem() &&
             this.TestClipboardTextGetChecklist() is HashChecklist checklist)
         {
-            if (this.BatchStatus != JobStatus.Started && this.CheckFilesHashBasedOnStringOrChecklist(checklist)
+            if (this.BatchStatus != JobStatus.Started && await this.CheckFilesHashBasedOnStringOrChecklist(checklist)
                 && Settings.Current.SwitchMainWndFgWhenNewHashCopied)
             {
                 // 先导航回主页，再激活窗口：导航是状态切换，激活是把窗口带到前台。
@@ -1056,6 +1064,7 @@ public class HomeViewModel : BaseViewModel
 
     public void ClearAllTableLinesAction(object param)
     {
+        this.checklistRequestVersion++;
         this.CancelDisplayedModelsAction(null);
         this.serial = 0;
         this.displayedModels.Clear();
@@ -1362,8 +1371,9 @@ public class HomeViewModel : BaseViewModel
         this.GenerateFileHashCheckReport();
     }
 
-    public bool CheckFilesHashBasedOnStringOrChecklist(HashChecklist checklist)
+    public async Task<bool> CheckFilesHashBasedOnStringOrChecklist(HashChecklist checklist)
     {
+        int requestVersion = ++this.checklistRequestVersion;
         HashChecklist localChecklist;
         if (checklist == null)
         {
@@ -1389,25 +1399,15 @@ public class HomeViewModel : BaseViewModel
                 // 清单没指明算法时按当前勾选算法补全 UNKNOWN 条目，使导出的
                 // 文件名<TAB>哈希值 清单读回后能正确判定「不匹配」，
                 // 也与命令行 verify 入口的解析结果保持一致
-                localChecklist = HashChecklist.File(this.HashStringOrChecklistPath,
-                    AlgorithmsModel.GetSelectedAlgos().Select(i => i.AlgoType));
-                try
-                {
-                    string parent = Path.GetDirectoryName(this.HashStringOrChecklistPath);
-                    // TODO: 统一 AssertRelativeGetFull 方法的调用方式
-                    // 目前的情况是在此处有调用，在 PathPackage 内也有调用
-                    localChecklist.AssertRelativeGetFull(parent, out _);
-                }
-                catch (Exception)
-                {
-                    NotificationSender.SnackbarWarning("无法获取校验信息文件的目录信息。");
-                    return false;
-                }
+                string path = this.HashStringOrChecklistPath;
+                var algorithms = AlgorithmsModel.GetSelectedAlgos().Select(i => i.AlgoType).ToArray();
+                localChecklist = HashChecklist.File(path, algorithms);
             }
             // HashStringOrChecklistPath 是一个文件，且哈希结果列表也是空
             else
             {
-                HashChecklist newChecklist = HashChecklist.File(this.HashStringOrChecklistPath);
+                string path = this.HashStringOrChecklistPath;
+                HashChecklist newChecklist = HashChecklist.File(path);
                 if (newChecklist.ReasonForFailure != null)
                 {
                     NotificationSender.SnackbarError(newChecklist.ReasonForFailure);
@@ -1416,7 +1416,7 @@ public class HomeViewModel : BaseViewModel
                 {
                     // 这里添加要计算哈希值的文件时，看作以多选文件的方式添，所以
                     // PathPackage 的 parent 参数应是 HashStringOrChecklistPath 所在目录
-                    string checklistDir = Path.GetDirectoryName(this.HashStringOrChecklistPath);
+                    string checklistDir = newChecklist.SourceDirectory;
                     this.BeginDisplayModels(new PathPackage(checklistDir, checklistDir, newChecklist,
                         Settings.Current.SelectedSearchMethodForChecklist));
                 }
@@ -1429,6 +1429,15 @@ public class HomeViewModel : BaseViewModel
         }
         if (localChecklist.ReasonForFailure == null)
         {
+            if (localChecklist.SourceDirectory != null)
+            {
+                var searchMethod = Settings.Current.SelectedSearchMethodForChecklist;
+                string firstError = await Task.Run(() => PathPackage.ResolveChecklistNames(localChecklist, searchMethod));
+                if (requestVersion != this.checklistRequestVersion)
+                    return false;
+                if (firstError != null)
+                    NotificationSender.SnackbarWarning(firstError);
+            }
             foreach (HashViewModel model in HashModelStore.HashViewModels)
             {
                 model.ApplyHashCmpResult(localChecklist);
@@ -1470,9 +1479,9 @@ public class HomeViewModel : BaseViewModel
         }
     }
 
-    private void StartCheckHashResultsAction(object param)
+    private async void StartCheckHashResultsAction(object param)
     {
-        this.CheckFilesHashBasedOnStringOrChecklist(null);
+        await this.CheckFilesHashBasedOnStringOrChecklist(null);
     }
 
     public ICommand StartCheckHashResultsCmd

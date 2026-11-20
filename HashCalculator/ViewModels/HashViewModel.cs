@@ -520,7 +520,7 @@ public class HashViewModel : BaseViewModel
         else if (Settings.Current.PreferChecklistAlgs && this.Arguments.HashChecklist != null)
         {
             this.AlgoInOutModels = AlgorithmsModel.GetAlgsFromChecklist(this.Arguments.HashChecklist,
-                this.RelativePath);
+                this.Information.FullName, this.RelativePath);
         }
         if ((this.AlgoInOutModels?.Count > 0) == false)
         {
@@ -890,7 +890,8 @@ public class HashViewModel : BaseViewModel
         }
         OutputType output = this.SelectedOutputType == OutputType.Unknown ?
             Settings.Current.SelectedOutputType : this.SelectedOutputType;
-        if (checklist.TryGetFileOrEmptyStrHashChecker(this.RelativePath, out HashChecker checker))
+        if (checklist.TryGetFileOrEmptyStrHashChecker(this.Information.FullName, this.RelativePath,
+            out HashChecker checker))
         {
             checker.ApplyTo(this, output);
         }

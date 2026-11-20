@@ -118,6 +118,10 @@ jobs:
           msbuild HashCalculator.sln /t:ShellExtensions /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=$env:VCTOOLSET /p:SolutionDir="$root" /m /v:minimal
           Get-ChildItem HashCalculator\LibraryFiles\HashCalculator*.dll | Select-Object Name,Length
 
+      - name: Run app regressions (x64)
+        shell: pwsh
+        run: dotnet run --project tests\HashCalculator.RegressionTests -c Release -p:Platform=x64
+
       - name: Publish app (x64)
         shell: pwsh
         run: |

@@ -361,12 +361,29 @@ public class AlgorithmsModel : BaseViewModel
         return default(IEnumerable<AlgoInOutModel>);
     }
 
-    public static ObservableCollection<AlgoInOutModel> GetAlgsFromChecklist(HashChecklist checklist, string fileName)
+    internal static AlgoType InferChecklistAlgorithm(int digestLength, AlgoType[] options)
+    {
+        AlgoType candidate = AlgoType.UNKNOWN;
+        foreach (AlgoInOutModel model in ProvidedAlgos)
+        {
+            if (model.IAlgo.DigestLength == digestLength &&
+                (options == null || options.Length == 0 || options.Contains(model.AlgoType)))
+            {
+                if (candidate != AlgoType.UNKNOWN)
+                    return AlgoType.UNKNOWN;
+                candidate = model.AlgoType;
+            }
+        }
+        return candidate;
+    }
+
+    public static ObservableCollection<AlgoInOutModel> GetAlgsFromChecklist(
+        HashChecklist checklist, string fullPath, string relativePath)
     {
         if (checklist != null)
         {
             IEnumerable<AlgoInOutModel> models = null;
-            if (checklist.TryGetFileHashChecker(fileName, out HashChecker checker))
+            if (checklist.TryGetFileOrEmptyStrHashChecker(fullPath, relativePath, out HashChecker checker))
             {
                 HashSet<AlgoType> algoTypes = checker.GetExistingAlgoTypes();
                 models = algoTypes.Count != 0 ? NewInOutModelsByNames(algoTypes) :

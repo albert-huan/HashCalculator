@@ -20,7 +20,7 @@ namespace HashCalculator
                 ".csv",
                 "$algo$,$hash$,$relpath$")
             {
-                UsingEncoding = EncodingEnum.ANSI,
+                UsingEncoding = EncodingEnum.UTF_8_BOM,
                 // 引号与转义由生成时按字段值添加，模板本身保持不含引号，
                 // 这样文件名里含逗号、双引号时也不会把列打乱
                 EscapeCsvValues = true,

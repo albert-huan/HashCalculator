@@ -297,6 +297,7 @@ public partial class MainWindow
             for (int i = 0; i < filePaths.Length; ++i)
             {
                 // 当 filePaths[i] 是分区根目录时 GetDirectoryName 返回 null
+                filePaths[i] = Path.GetFullPath(filePaths[i]);
                 string parent = Path.GetDirectoryName(filePaths[i]) ?? filePaths[i];
                 PathPackage package = new PathPackage(parent, filePaths[i], hashChecklist,
                     Settings.Current.SelectedSearchMethodForDragDrop);
@@ -333,7 +334,7 @@ public partial class MainWindow
                 }
                 // 这里添加要计算哈希值的文件时，看作以多选文件的方式添，所以
                 // PathPackage 的 parent 参数应是 checklistPath 所在目录
-                string filesDir = Path.GetDirectoryName(checklistPath);
+                string filesDir = newChecklist.SourceDirectory;
                 PathPackage pathPackage = new PathPackage(filesDir, filesDir, newChecklist,
                     Settings.Current.SelectedSearchMethodForChecklist);
                 pathPackage.PresetAlgoTypes = types;
